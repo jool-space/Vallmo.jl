@@ -1,0 +1,4 @@
+[deps]
+BFloat16s = "ab4f0b2a-ad5b-11e8-123f-65d77653426b"
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+Vallmo = "d7e4f3a4-021c-470a-a969-608a99edde6c"
