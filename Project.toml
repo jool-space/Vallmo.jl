@@ -1,9 +1,29 @@
 name = "Vallmo"
 uuid = "d7e4f3a4-021c-470a-a969-608a99edde6c"
-authors = ["AntonOresten <antonoresten@proton.me> and contributors"]
 version = "1.0.0-DEV"
+authors = ["AntonOresten <antonoresten@proton.me> and contributors"]
+
+[deps]
+BFloat16s = "ab4f0b2a-ad5b-11e8-123f-65d77653426b"
+CUDACore = "bd0ed864-bdfe-4181-a5ed-ce625a5fdea2"
+HuggingFaceTokenizers = "a6888d44-1185-43bb-bd0f-7806f9976d18"
+JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
+Microfloats = "31c70f10-a750-4521-b13c-797315ae2933"
+Mmap = "a63ad114-7e13-5084-954f-fe012c677804"
+Pol = "4d414b72-cacd-4c1f-bb87-6585853948d5"
+cuBLASLt = "448fee3d-7d89-4b6e-8554-2e2b5f03afa7"
+cuTile = "0dea8319-8c4a-4662-a73d-20234d115b9a"
 
 [compat]
+BFloat16s = "0.6.1"
+CUDACore = "6.2"
+HuggingFaceTokenizers = "0.1.0"
+JSON = "1.6.1"
+Microfloats = "0.2.2"
+Mmap = "1.11.0"
+Pol = "0.1.0"
+cuBLASLt = "0.1.1"
+cuTile = "0.3.0"
 julia = "1.11"
 
 [extras]
