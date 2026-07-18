@@ -1,3 +1,6 @@
 [deps]
 Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
 Vallmo = "d7e4f3a4-021c-470a-a969-608a99edde6c"
+
+[compat]
+Documenter = "1.17.0"
