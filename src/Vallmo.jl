@@ -3,7 +3,7 @@ module Vallmo
 include("safetensors/safetensors.jl")
 public safetensors
 
-include("sizes.jl")
+using Vall: @sizes    # extracted (two consumers: our kernels, Vall's verbs)
 public @sizes
 
 include("splitaxis.jl")

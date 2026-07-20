@@ -109,40 +109,4 @@ end
         @test_throws ErrorException Vallmo.tree(Dict("a" => [1], "a.b" => [2]))
     end
 
-    @testset "@sizes" begin
-        Q, K, V = zeros(64, 8, 2), zeros(64, 100, 4, 2), zeros(32, 100, 4, 2)
-        Vallmo.@sizes begin
-            Q => (Dqk, Hq, B)
-            K => (Dqk, Lkv, Hkv, B)
-            V => (Dv, Lkv, Hkv, B)
-        end
-        @test (Dqk, Hq, B, Lkv, Hkv, Dv) == (64, 8, 2, 100, 4, 32)
-
-        Kbad = zeros(63, 100, 4, 2)
-        @test_throws DimensionMismatch Vallmo.@sizes begin
-            Q => (D, H, B2)
-            Kbad => (D, L, Hk, B2)
-        end
-        @test_throws DimensionMismatch Vallmo.@sizes Q => (D2, N2)   # ndims
-        X = zeros(3, 7)
-        Vallmo.@sizes X => (3, N3)                                   # literal + single-line
-        @test N3 == 7
-        @test_throws DimensionMismatch Vallmo.@sizes X => (4, _)
-
-        R = zeros(3, 3, 5)
-        Vallmo.@sizes R => (3, 3, N4)                                # repeated literals
-        @test N4 == 5
-
-        Y, bias = zeros(64, 2), nothing
-        Vallmo.@sizes begin                                          # nothing skips its line
-            Y    => (D4, B4)
-            bias => (D4,)
-        end
-        @test (D4, B4) == (64, 2)
-        badbias = zeros(63)
-        @test_throws DimensionMismatch Vallmo.@sizes begin           # present optional checks
-            Y       => (D5, _)
-            badbias => (D5,)
-        end
-    end
 end

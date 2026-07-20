@@ -1,5 +1,5 @@
 # qwen35.jl — the model is a file. Weights are nouns (the checkpoint's own
-# tree, packed once at load), forwards are verbs (kernels + cuBLASLt).
+# tree, packed once at load), forwards are verbs (kernels + Vall).
 # Decode temporaries live in a model-owned Arena: step! opens a step frame
 # (residual x/xn/h), each layer a nested frame (everything else), so all
 # layers share one region and every step replays the same addresses — which
@@ -26,7 +26,8 @@
 #   mtp_* weights (multi-token prediction) sit in the tree, unread.
 
 using CUDACore: CUDACore, cu, CuArray, CuMatrix, CuVector
-using cuBLASLt: matmul!
+using Vall: linear!, linear
+import cuBLASLt    # loading it is the opt-in: Vall's :lt provider activates
 
 softplus(x) = log1p(exp(x))
 
@@ -151,7 +152,7 @@ function decode!(h, l::AttnLayer, m::Qwen35, gen, xn)
     # most one wrapper over a CuArray (cuTile's device_pointer limit), so:
     # reshape the whole buffer (still a CuArray), then single strided views.
     qkv = alloc(BFloat16, Dh * (2Hq + 2Hkv), B)
-    matmul!(qkv, transpose(l.Wqkv), xn)
+    linear!((; y = qkv), xn, l.Wqkv)
     qkv3 = reshape(qkv, (Dh, 2Hq + 2Hkv, B))
     qg, k, v = splitaxis(qkv3, (2Hq, Hkv, Hkv); dims = 2)
     q      = view(qkv3, :, 1:2:2Hq, :)     # [q|gate] interleaves per head:
@@ -163,7 +164,7 @@ function decode!(h, l::AttnLayer, m::Qwen35, gen, xn)
         m.rope.cos, m.rope.sin; positions = gen.positions, eps, offset = 1f0)
     (; O) = decode_attention(q, l.K_cache, l.V_cache; lengths = gen.positions)
     O .*= sigmoid.(q_gate)
-    matmul!(h, transpose(l.Wo), reshape(O, :, B))
+    linear!((; y = h), reshape(O, :, B), l.Wo)
     return
 end
 
@@ -172,8 +173,8 @@ function decode!(h, l::DeltaNetLayer, m::Qwen35, gen, xn)
     n = 2DkL * HkL + DvL * HvL
     qz = alloc(BFloat16, n + DvL * HvL, B)
     ab = alloc(BFloat16, 2HvL, B)
-    matmul!(qz, transpose(l.Wqz), xn)
-    matmul!(ab, transpose(l.Wab), xn)
+    linear!((; y = qz), xn, l.Wqz)
+    linear!((; y = ab), xn, l.Wab)
     qz3 = reshape(qz, (DkL, 2HkL + 2HvL, B))
     conv_in = view(qz, 1:n, :)                       # the q|k|v slots, flat
     _, _, _, z = splitaxis(qz3, (HkL, HkL, HvL, HvL); dims = 2)
@@ -187,18 +188,18 @@ function decode!(h, l::DeltaNetLayer, m::Qwen35, gen, xn)
     (; O) = fused_deltanet_decode(q, k, v, alpha, beta, z,
         l.A_log, l.dt_bias, l.gnorm_w, l.S;
         eps, output_override = (; S′ = l.S))                     # S′ = S: in place
-    matmul!(h, transpose(l.Wout), reshape(O, :, B))
+    linear!((; y = h), reshape(O, :, B), l.Wout)
     return
 end
 
 function mlp!(h, mlp, cfg, xn)
     (; inter, B) = cfg
     gu = alloc(BFloat16, 2inter, B)
-    matmul!(gu, transpose(mlp.Wgu), xn)
+    linear!((; y = gu), xn, mlp.Wgu)
     gate, up = splitaxis(gu, 2)
     mid = alloc(BFloat16, inter, B)
     mid .= silu.(gate) .* up
-    matmul!(h, transpose(mlp.Wd), mid)
+    linear!((; y = h), mid, mlp.Wd)
     return
 end
 
@@ -253,7 +254,7 @@ function forward(l::AttnLayer, m::Qwen35, xn, T, B)
     cos_t = @view m.rope.cos[:, 1:T]
     sin_t = @view m.rope.sin[:, 1:T]
     (; eps, Dh, Hq, Hkv, rot_half) = m.cfg
-    qkv = matmul!(similar(xn, size(l.Wqkv, 2), T * B), transpose(l.Wqkv), xn)
+    qkv = linear(Similar(xn), xn, l.Wqkv).y
     Nq = 2Dh * Hq
     qg = reshape(view(qkv, 1:Nq, :), (Dh, 2, Hq, T, B))
     q  = qg[:, 1, :, :, :]                       # (Dh, Hq, T, B)
@@ -271,14 +272,14 @@ function forward(l::AttnLayer, m::Qwen35, xn, T, B)
         view(l.K_cache, :, 1:T, :, :), view(l.V_cache, :, 1:T, :, :);
         causal = true)
     o .*= sigmoid.(tsecond(Float32.(g)))
-    return matmul!(similar(xn), transpose(l.Wo),
-                   reshape(permutedims(o, (1, 3, 2, 4)), (Dh * Hq, T * B)))
+    return linear(Similar(xn),
+                  reshape(permutedims(o, (1, 3, 2, 4)), (Dh * Hq, T * B)), l.Wo).y
 end
 
 function forward(l::DeltaNetLayer, m::Qwen35, xn, T, B)
     (; eps, DkL, DvL, HkL, HvL) = m.cfg
-    qz = matmul!(similar(xn, size(l.Wqz, 2), T * B), transpose(l.Wqz), xn)
-    ab = matmul!(similar(xn, size(l.Wab, 2), T * B), transpose(l.Wab), xn)
+    qz = linear(Similar(xn), xn, l.Wqz).y
+    ab = linear(Similar(xn), xn, l.Wab).y
     n = 2DkL * HkL + DvL * HvL
     conv = similar(xn, n, T, B)
     causal_conv1d_sequence!((; Y = conv), reshape(qz[1:n, :], (n, T, B)),
@@ -305,8 +306,8 @@ function forward(l::DeltaNetLayer, m::Qwen35, xn, T, B)
     rstd = 1f0 ./ .√(sum(abs2, o; dims=1) ./ DvL .+ eps)
     o .*= rstd .* reshape(Float32.(l.gnorm_w), (DvL, 1, 1, 1)) .*
           silu.(tsecond(Float32.(z)))
-    return matmul!(similar(xn), transpose(l.Wout),
-        BFloat16.(reshape(permutedims(o, (1, 3, 2, 4)), (DvL * HvL, T * B))))
+    return linear(Similar(xn),
+        BFloat16.(reshape(permutedims(o, (1, 3, 2, 4)), (DvL * HvL, T * B))), l.Wout).y
 end
 
 function prefill!(m::Qwen35, gen, ids)
@@ -322,9 +323,9 @@ function prefill!(m::Qwen35, gen, ids)
         h = forward(l, m, xn, T, B)
         fused_add_rms_norm!((; Y = xn, X′ = x), x, h, l.norm2; eps, offset = 1f0)
 
-        gu = matmul!(similar(x, 2m.cfg.inter, T * B), transpose(l.mlp.Wgu), xn)
+        gu = linear(Similar(xn), xn, l.mlp.Wgu).y
         mid = silu.(view(gu, 1:m.cfg.inter, :)) .* view(gu, m.cfg.inter+1:2m.cfg.inter, :)
-        h = matmul!(similar(x), transpose(l.mlp.Wd), mid)
+        h = linear(Similar(x), mid, l.mlp.Wd).y
         next_w = i == length(m.layers) ? m.norm_w : m.layers[i+1].norm1
         fused_add_rms_norm!((; Y = xn, X′ = x), x, h, next_w; eps, offset = 1f0)
     end
