@@ -83,8 +83,15 @@ function serve_worker(model, gen, tok, session, jobs)
                 completion_tokens = length(acc),
                 timing = out.timing)))
         catch err
-            @error "generation failed" exception = (err, catch_backtrace())
-            put!(job.out, (:error, sprint(showerror, err)))
+            if err isa InvalidStateException      # handler closed `out`: client gone
+                @info "generation aborted (client disconnected)"
+            else
+                @error "generation failed" exception = (err, catch_backtrace())
+                try
+                    put!(job.out, (:error, sprint(showerror, err)))
+                catch
+                end
+            end
         finally
             close(job.out)
         end
@@ -118,6 +125,11 @@ function handle_chat(http, st)
     id = "chatcmpl-" * string(st.counter[] += 1)
     created = round(Int, time())
 
+    # If the client disconnects, the SSE write below throws and this
+    # handler dies — closing `out` turns the worker's next put! into an
+    # exception (its abort path) instead of a forever-block on a full
+    # channel nobody drains.
+    try
     if get(body, "stream", false) === true
         HTTP.setstatus(http, 200)
         HTTP.setheader(http, "Content-Type" => "text/event-stream")
@@ -152,6 +164,9 @@ function handle_chat(http, st)
                 message = (; role = "assistant", content = join(parts)))],
             usage = (; prompt_tokens = T, completion_tokens,
                 total_tokens = T + completion_tokens)))
+    end
+    finally
+        close(out)
     end
     return
 end
