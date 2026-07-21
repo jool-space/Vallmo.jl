@@ -46,6 +46,7 @@
     pane_rect::Rect = Rect()
     smooth::Matrix{ColorRGBA} = Matrix{ColorRGBA}(undef, 0, 0)  # per-cell color EMA
     max_tokens::Int = 0                  # 0 = let the server default
+    show_help::Bool = false              # /help panel; any key dismisses
     # slash-command mode (see commands.jl)
     cmd_sel::Int = 1
     cmd_last::String = ""
@@ -61,6 +62,10 @@ function init!(m::VallmoChatModel, ::Terminal)
 end
 
 function update!(m::VallmoChatModel, evt::KeyEvent)
+    if m.show_help                       # any key closes the help panel
+        m.show_help = false
+        return
+    end
     # Command mode owns navigation/confirm/cancel while the input is "/…"
     if evt.key != :ctrl_c
         cmdline = _vc_cmdline(m)
@@ -80,9 +85,21 @@ function update!(m::VallmoChatModel, evt::KeyEvent)
             m.quit = true
         end
     elseif evt.key == :enter
-        m.streaming || _vc_submit!(m)
-    elseif evt.key == :ctrl && evt.char == 'j'
-        handle_key!(m.input, KeyEvent(:enter))   # newline inside the input
+        # A line ending in \ continues on the next line; otherwise send.
+        li = m.input.lines[m.input.cursor_row]
+        if !isempty(li) && li[end] == '\\'
+            pop!(li)
+            insert!(m.input.lines, m.input.cursor_row + 1, Char[])
+            m.input.cursor_row += 1
+            m.input.cursor_col = 0
+        else
+            m.streaming || _vc_submit!(m)
+        end
+    elseif evt.key == :ctrl && evt.char == 'd'
+        # Shell convention: EOF quits on an empty draft, deletes forward
+        # in a non-empty one.
+        isempty(strip(text(m.input))) ? (m.quit = true) :
+                                        handle_key!(m.input, KeyEvent(:delete))
     elseif evt.key == :ctrl && evt.char == 'w'
         _vc_delete_word!(m.input)                # readline: also what most
     elseif evt.key == :ctrl && evt.char == 'u'   # macOS terminals send for
@@ -132,9 +149,22 @@ function _vc_copy_selection!(m::VallmoChatModel)
     m.sel_anchor = m.sel_head = 0
     isempty(idxs) && return
     txt = join((rstrip(join(sp.content for sp in m.shown[i])) for i in idxs), '\n')
-    print(stdout, "\e]52;c;", base64encode(txt), "\a")
-    flush(stdout)
+    _vc_copy_text(txt)
     m.status = "copied $(length(idxs)) line$(length(idxs) == 1 ? "" : "s")"
+    return
+end
+
+# Every clipboard road at once: OSC 52 (ST-terminated; wrapped for tmux
+# passthrough) reaches the terminal's clipboard through ssh and
+# vscode-remote; clipboard_copy! (xclip/pbcopy) covers a local session
+# where the terminal ignores OSC 52.
+function _vc_copy_text(txt::AbstractString)
+    seq = "\e]52;c;" * base64encode(txt) * "\e\\"
+    haskey(ENV, "TMUX") &&
+        (seq = "\ePtmux;" * replace(seq, "\e" => "\e\e") * "\e\\")
+    print(stdout, seq)
+    flush(stdout)
+    clipboard_copy!(String(txt))
     return
 end
 
@@ -237,7 +267,7 @@ function _vc_drain!(m::VallmoChatModel)
             m.live = ""
             m.streaming = false
         elseif kind === :error
-            m.status = payload
+            m.status = "⚠ " * payload
             isempty(m.live) || push!(m.messages, (:assistant, m.live))
             m.live = ""
             m.streaming = false
@@ -358,9 +388,9 @@ function view(m::VallmoChatModel, f::Frame)
 
     input_h = clamp(length(m.input.lines), 1, 5)
     rows = split_layout(Layout(Vertical, [Fixed(1), Fill(), Fixed(1),
-                                          Fixed(input_h), Fixed(1)]), area)
-    length(rows) < 5 && return
-    header, main, seprow, inputrow, footer = rows
+                                          Fixed(input_h)]), area)
+    length(rows) < 4 && return
+    header, main, seprow, inputrow = rows
 
     # The transcript covers the whole main area — text flows from the
     # left like poppy_chat's poem, only the scrollbar rides the far right
@@ -429,23 +459,25 @@ function view(m::VallmoChatModel, f::Frame)
     m.shown = content
     m.shown_off = m.pane.offset       # finalized by render (auto-follow)
 
-    # Separator, input (❯ prompt + multi-line TextArea), status
+    # Separator (status rides its right end), then the input
     set_string!(buf, seprow.x, seprow.y, "─"^seprow.width,
                 tstyle(:text_dim, dim=true))
+    if !isempty(m.status)
+        s = " " * first(m.status, max(seprow.width - 12, 8)) * " "
+        set_string!(buf, right(seprow) - length(s) - 2, seprow.y, s,
+                    startswith(m.status, "⚠") ? tstyle(:error) : tstyle(:text_dim))
+    end
     set_string!(buf, inputrow.x + 1, inputrow.y, "❯", tstyle(:accent, bold=true))
     m.input.tick = m.tick
     render(m.input, Rect(inputrow.x + 3, inputrow.y,
                          inputrow.width - 3, inputrow.height), buf)
-    hints = m.streaming ? " [Esc]stop [PgUp/wheel]scroll [drag]copy [/]settings" :
-        " [Enter]send [^J]newline [/]settings [Esc]quit [^L]clear [drag]copy"
-    left = isempty(m.status) ? hints : " ⚠ $(m.status)"
-    set_string!(buf, footer.x + 1, footer.y, first(left, area.width - 2),
-                isempty(m.status) ? tstyle(:text_dim, dim=true) : tstyle(:error))
 
     # Command popup, riding just above the separator
     cmd_st === nothing ||
         _vc_cmd_popup!(m, buf, Rect(main.x + 1, main.y, main.width - 2,
                                     main.height), cmd_st)
+
+    m.show_help && _vc_help_panel!(buf, area)
 
     # Selection highlight: whole lines between anchor and head.
     if m.sel_anchor != 0

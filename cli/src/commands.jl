@@ -71,7 +71,60 @@ const CHAT_COMMANDS = ChatCommand[
         m -> String[],
         (m, _) -> (empty!(m.messages); m.built_n = -1; "cleared"),
         false),
+    ChatCommand("help", "",
+        "keys and commands (any key closes)",
+        m -> "",
+        m -> String[],
+        (m, _) -> (m.show_help = true; ""),
+        false),
+    ChatCommand("quit", "",
+        "leave the chat",
+        m -> "",
+        m -> String[],
+        (m, _) -> (m.quit = true; ""),
+        false),
 ]
+
+const HELP_LINES = [
+    ("keys", ""),
+    ("Enter", "send — end a line with \\ to continue on a new line"),
+    ("Esc", "dismiss/cancel: selection → command → stream (keeps partial) → quit"),
+    ("Ctrl+D", "quit on an empty draft · delete forward otherwise"),
+    ("↑ ↓ PgUp PgDn", "scroll the transcript (↑↓ move the cursor in a multi-line draft)"),
+    ("wheel / drag", "scroll · left-drag selects lines, release copies them"),
+    ("Ctrl+W · Ctrl+U", "delete word · delete to line start (opt-/cmd-backspace on macOS)"),
+    ("Ctrl+L", "clear the conversation"),
+    ("", ""),
+    ("commands", "type / — fuzzy matched, ↑↓ + Tab + Enter, live preview, Esc reverts"),
+    ("/" * join((c.name for c in CHAT_COMMANDS), "  /"), ""),
+]
+
+function _vc_help_panel!(buf, area::Rect)
+    w = min(78, area.width - 4)
+    h = length(HELP_LINES) + 2
+    x = area.x + (area.width - w) ÷ 2
+    y = area.y + max((area.height - h) ÷ 2, 1)
+    base = light_mode() ? SLATE.c200 : SLATE.c800
+    for (i, yy) in enumerate(y:y+h-1)
+        yy > bottom(area) && break
+        set_string!(buf, x, yy, " "^w, Style(bg = base))
+        i == 1 || i == h && continue
+    end
+    for (i, (key, desc)) in enumerate(HELP_LINES)
+        yy = y + i
+        yy > bottom(area) && break
+        if isempty(desc)
+            set_string!(buf, x + 2, yy, first(key, w - 4),
+                        Style(fg = tstyle(:accent).fg, bg = base, bold = true))
+        else
+            set_string!(buf, x + 2, yy, key,
+                        Style(fg = tstyle(:primary).fg, bg = base, bold = true))
+            set_string!(buf, x + 20, yy, first(desc, max(w - 22, 0)),
+                        Style(fg = tstyle(:text).fg, bg = base))
+        end
+    end
+    return
+end
 
 # Subsequence fuzzy match: nothing on miss, higher score = better.
 # Consecutive hits and early positions win; shorter candidates break ties.
