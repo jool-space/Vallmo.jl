@@ -446,10 +446,12 @@ function _render_poppy_braille!(pixels::Matrix{ColorRGBA}, zbuf::Matrix{Float64}
             end
             color = _poppy_term_color(fade < 1.0 ? _poppy_tint(best, fade) : best,
                                       truecolor)
-            # Quadratic coverage falloff: a 1-dot cell gets ~1.6% of the
-            # base wash, not 35% (sqrt) — sparse rim cells melt into the
-            # canvas instead of reading as blocky background squares.
-            tint = _poppy_tint(best, 0.38 * fade * (ndots / 8)^2)
+            # Coverage falloff: quadratic with a small floor. sqrt made
+            # sparse rim cells blocky (1 dot -> 35% of the base wash);
+            # pure quadratic made lone dots glare against bare canvas.
+            # The floor keeps a faint halo (~14%) so isolated dots stay
+            # seated without a visible square.
+            tint = _poppy_tint(best, 0.38 * fade * (0.13 + 0.87 * (ndots / 8)^2))
             tints[cy, cx] = tint
             style = if bg == :cover
                 Style(fg=color, bg=_poppy_term_color(tint, truecolor))
