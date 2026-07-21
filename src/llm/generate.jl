@@ -4,12 +4,15 @@
 #
 # ── The model contract ──────────────────────────────────────────────────────
 #
-#   prefill!(model, gen, ids)   ids :: (T, B) device Int32, 1-based.
+#   prefill!(model, gen, ids; offset = 0)   ids :: (T, B) device Int32, 1-based.
 #     Eager. Fills the model's caches (bulk writes, host offsets fine here),
 #     computes the first generated token into `gen.result`, and — as its
 #     FINAL act — seeds the clock: `gen.positions .= prompt_lengths .+ 1`.
 #     (Attention inside prefill uses the pre-seed prompt lengths; seeding
 #     last keeps "positions = decode's clock" exception-free.)
+#     `offset > 0` is a suffix prefill: `ids` continue an already-resident
+#     prefix of `offset` tokens (prefix caching — the caller restored the
+#     matching recurrent state first).
 #
 #   step!(model, gen)
 #     One decode step, and the capture target, so it must be:
@@ -90,12 +93,16 @@ poll(gen::Generation, lo::Int, hi::Int) = Array(@view gen.tokens_out[lo:hi, :])
 
 function _run!(model, gen::Generation, ids;
     max_new_tokens, launch_step!::F, eos, poll_every, on_tokens,
+    prefill_offset::Int = 0, on_prefilled = nothing,
 ) where {F}
     reset!(gen)
     prefill_s = CUDACore.@elapsed begin
-        prefill!(model, gen, ids)
+        prefill!(model, gen, ids; offset = prefill_offset)
         advance!(gen)                        # harvest prefill's token as row 1
     end
+    # The prefix-caching hook: state is post-prefill, pre-decode — the
+    # last moment it matches the prompt rather than the generation.
+    isnothing(on_prefilled) || on_prefilled()
 
     n = 1
     polled = 0
@@ -131,8 +138,10 @@ baseline that `generate_captured!` must match token-for-token.
 """
 function generate!(model, gen::Generation, ids; max_new_tokens,
     eos = nothing, poll_every = 8, on_tokens = nothing,
+    prefill_offset::Int = 0, on_prefilled = nothing,
 )
     _run!(model, gen, ids; max_new_tokens, eos, poll_every, on_tokens,
+        prefill_offset, on_prefilled,
         launch_step! = () -> (step!(model, gen); advance!(gen)))
 end
 
@@ -166,6 +175,7 @@ model passes its own [`CaptureSession`](@ref) and replays from token 1.
 function generate_captured!(model, gen::Generation, ids; max_new_tokens,
     warmup = 3, session::CaptureSession = CaptureSession(),
     eos = nothing, poll_every = 8, on_tokens = nothing,
+    prefill_offset::Int = 0, on_prefilled = nothing,
 )
     function launch_step!()
         if session.n_warm < warmup
@@ -181,5 +191,6 @@ function generate_captured!(model, gen::Generation, ids; max_new_tokens,
             launch(session.exec)
         end
     end
-    _run!(model, gen, ids; max_new_tokens, eos, poll_every, on_tokens, launch_step!)
+    _run!(model, gen, ids; max_new_tokens, eos, poll_every, on_tokens,
+        prefill_offset, on_prefilled, launch_step!)
 end

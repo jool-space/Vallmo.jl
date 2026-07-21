@@ -268,9 +268,9 @@ end
 # (Dh, H, T, B) → (Dh, T, H, B), the kernels' time-second convention
 tsecond(x) = permutedims(x, (1, 3, 2, 4))
 
-function forward(l::AttnLayer, m::Qwen35, xn, T, B)
-    cos_t = @view m.rope.cos[:, 1:T]
-    sin_t = @view m.rope.sin[:, 1:T]
+function forward(l::AttnLayer, m::Qwen35, xn, T, B; offset::Int = 0)
+    cos_t = @view m.rope.cos[:, offset+1:offset+T]
+    sin_t = @view m.rope.sin[:, offset+1:offset+T]
     (; eps, Dh, Hq, Hkv, rot_half) = m.cfg
     qkv = linear(Similar(xn), xn, l.Wqkv).y
     Nq = 2Dh * Hq
@@ -282,26 +282,43 @@ function forward(l::AttnLayer, m::Qwen35, xn, T, B)
 
     qr = tsecond(apply_rope(head_rmsnorm(q, l.qw, eps), cos_t, sin_t, rot_half))
     kr = tsecond(apply_rope(head_rmsnorm(k, l.kw, eps), cos_t, sin_t, rot_half))
-    copyto!(view(l.K_cache, :, 1:T, :, :), BFloat16.(kr))
-    copyto!(view(l.V_cache, :, 1:T, :, :), BFloat16.(tsecond(v)))
+    copyto!(view(l.K_cache, :, offset+1:offset+T, :, :), BFloat16.(kr))
+    copyto!(view(l.V_cache, :, offset+1:offset+T, :, :), BFloat16.(tsecond(v)))
 
+    # Queries are the suffix of keys — the kernel derives the causal
+    # offset as k_len − q_len, so chunked (suffix) prefill is free.
     o = similar(xn, Dh, T, Hq, B)
     attention!((; O = o), BFloat16.(qr),
-        view(l.K_cache, :, 1:T, :, :), view(l.V_cache, :, 1:T, :, :);
+        view(l.K_cache, :, 1:offset+T, :, :), view(l.V_cache, :, 1:offset+T, :, :);
         causal = true)
     o .*= sigmoid.(tsecond(Float32.(g)))
     return linear(Similar(xn),
                   reshape(permutedims(o, (1, 3, 2, 4)), (Dh * Hq, T * B)), l.Wo).y
 end
 
-function forward(l::DeltaNetLayer, m::Qwen35, xn, T, B)
+function forward(l::DeltaNetLayer, m::Qwen35, xn, T, B; offset::Int = 0)
     (; eps, DkL, DvL, HkL, HvL) = m.cfg
     qz = linear(Similar(xn), xn, l.Wqz).y
     ab = linear(Similar(xn), xn, l.Wab).y
     n = 2DkL * HkL + DvL * HvL
-    conv = similar(xn, n, T, B)
-    causal_conv1d_sequence!((; Y = conv), reshape(qz[1:n, :], (n, T, B)),
-        l.conv_w, l.conv_b; σ = silu, S′ = l.conv_state)
+    X = reshape(qz[1:n, :], (n, T, B))
+    if offset == 0
+        conv = similar(xn, n, T, B)
+        causal_conv1d_sequence!((; Y = conv), X,
+            l.conv_w, l.conv_b; σ = silu, S′ = l.conv_state)
+    else
+        # The conv window crosses the suffix boundary; the ring buffer's
+        # columns 2:K hold the last K−1 raw prefix inputs (zeros where the
+        # prefix was shorter — the kernel's own left padding), so prepend
+        # them, convolve, and drop the K−1 warm-up outputs. The S′ seed
+        # from the extended tail is the correct new state.
+        Km1 = size(l.conv_state, 2) - 1
+        Xext = cat(l.conv_state[:, 2:end, :], X; dims = 2)
+        Yext = similar(xn, n, T + Km1, B)
+        causal_conv1d_sequence!((; Y = Yext), Xext,
+            l.conv_w, l.conv_b; σ = silu, S′ = l.conv_state)
+        conv = Yext[:, Km1+1:end, :]
+    end
     cf = reshape(conv, (n, T * B))
 
     l2n(y) = Float32.(y) ./ .√(sum(abs2, Float32.(y); dims=1) .+ 1f-6)
@@ -328,9 +345,11 @@ function forward(l::DeltaNetLayer, m::Qwen35, xn, T, B)
         BFloat16.(reshape(permutedims(o, (1, 3, 2, 4)), (DvL * HvL, T * B))), l.Wout).y
 end
 
-function prefill!(m::Qwen35, gen, ids)
+function prefill!(m::Qwen35, gen, ids; offset::Int = 0)
     (; D, eps) = m.cfg
     T, B = size(ids)
+    offset + T <= m.cfg.Ctx ||
+        throw(ArgumentError("prefill past Ctx: offset $offset + $T tokens > $(m.cfg.Ctx)"))
 
     x = m.E[:, vec(ids)]                                 # (D, T·B) gather
     xn = similar(x)
@@ -338,7 +357,7 @@ function prefill!(m::Qwen35, gen, ids)
     rms_norm!((; Y = xn), x, first(m.layers).norm1; eps, offset = 1f0)   # prologue (see step!)
 
     for (i, l) in enumerate(m.layers)
-        h = forward(l, m, xn, T, B)
+        h = forward(l, m, xn, T, B; offset)
         fused_add_rms_norm!((; Y = xn, X′ = x), x, h, l.norm2; eps, offset = 1f0)
 
         gu = linear(Similar(xn), xn, l.mlp.Wgu).y
@@ -350,6 +369,38 @@ function prefill!(m::Qwen35, gen, ids)
 
     xlast = view(reshape(xn, (D, T, B)), :, T, :)        # uniform T; ragged is M2+
     lm_head_argmax!((; Result = gen.result), xlast, m.E)
-    gen.positions .= Int32(T + 1)                        # the final act: seed the clock
+    gen.positions .= Int32(offset + T + 1)               # the final act: seed the clock
     return
+end
+
+# ── prefix caching: the recurrent-state snapshot ─────────────────────────────
+
+"""
+    snapshot(m::Qwen35) -> snap
+    snapshot!(snap, m::Qwen35) -> snap
+    restore!(m::Qwen35, snap) -> m
+
+The state a resumable prefix needs: deltanet `S` and `conv_state` per
+layer — the only model state decode mutates in place. Attention K/V
+needs no snapshot: decode appends *beyond* the prefix rows and a suffix
+prefill overwrites from the boundary. Take the snapshot right after a
+prefill (before decode pollutes the recurrence with generated tokens),
+restore it before continuing with `prefill!(...; offset)` on the suffix.
+"""
+snapshot(m::Qwen35) =
+    Any[l isa DeltaNetLayer ? (copy(l.S), copy(l.conv_state)) : nothing
+        for l in m.layers]
+
+function snapshot!(snap, m::Qwen35)
+    for (s, l) in zip(snap, m.layers)
+        s === nothing || (copyto!(s[1], l.S); copyto!(s[2], l.conv_state))
+    end
+    return snap
+end
+
+function restore!(m::Qwen35, snap)
+    for (s, l) in zip(snap, m.layers)
+        s === nothing || (copyto!(l.S, s[1]); copyto!(l.conv_state, s[2]))
+    end
+    return m
 end

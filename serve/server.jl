@@ -51,10 +51,33 @@ end
 # except a trailing replacement char (a token split mid-UTF-8), which is
 # withheld until its partner token lands.
 function serve_worker(model, gen, tok, session, jobs)
+    # Prefix cache, one conversation slot: `snap` is the recurrent state
+    # right after prefilling `cached` (think-blocks are stripped from
+    # history by the template, so the *generated* sequence is never a
+    # prefix of the next prompt — the post-prefill state is). A request
+    # whose ids strictly extend `cached` restores and prefills only the
+    # suffix; anything else resets and prefills in full.
+    cached = Int32[]
+    snap = nothing
     for job in jobs
         try
-            Vallmo.reset!(model)
-            ids = CuMatrix{Int32}(job.ids)
+            ids_h = vec(job.ids)
+            Tc = length(cached)
+            hit = snap !== nothing && 0 < Tc < length(ids_h) &&
+                  view(ids_h, 1:Tc) == cached
+            if hit
+                Vallmo.restore!(model, snap)
+            else
+                Vallmo.reset!(model)
+                Tc = 0
+            end
+            cached = Int32[]        # invalid until the new snapshot lands
+            on_prefilled = () -> begin
+                snap = snap === nothing ? Vallmo.snapshot(model) :
+                                          Vallmo.snapshot!(snap, model)
+                cached = ids_h
+            end
+            ids = CuMatrix{Int32}(reshape(ids_h[Tc+1:end], :, 1))
             acc = Int32[]
             hit_eos = false
             sent = ""
@@ -76,11 +99,14 @@ function serve_worker(model, gen, tok, session, jobs)
                 emit!()
             end
             out = generate_captured!(model, gen, ids; session, on_tokens,
-                max_new_tokens = job.max_new, eos = model.eos)
+                max_new_tokens = job.max_new, eos = model.eos,
+                prefill_offset = Tc, on_prefilled)
+            Tc > 0 && @info "prefix cache: reused $Tc tokens, prefilled $(size(ids, 1))"
             emit!()                                    # flush a withheld tail
             put!(job.out, (:done, (;
                 finish = hit_eos ? "stop" : "length",
                 completion_tokens = length(acc),
+                reused = Tc,
                 timing = out.timing)))
         catch err
             if err isa InvalidStateException      # handler closed `out`: client gone
@@ -151,10 +177,14 @@ function handle_chat(http, st)
     else
         parts = String[]
         finish, completion_tokens = "stop", 0
+        vallmo = (;)
         for (kind, payload) in out
             kind === :delta && push!(parts, payload)
-            kind === :done &&
-                ((finish, completion_tokens) = (payload.finish, payload.completion_tokens))
+            kind === :done && begin
+                finish, completion_tokens = payload.finish, payload.completion_tokens
+                vallmo = (; payload.reused, prefill_s = payload.timing.prefill_s,
+                    tok_s = payload.timing.tok_s)
+            end
             kind === :error && return respond_json(http, 500,
                 (; error = (; message = payload)))
         end
@@ -163,7 +193,8 @@ function handle_chat(http, st)
             choices = [(; index = 0, finish_reason = finish,
                 message = (; role = "assistant", content = join(parts)))],
             usage = (; prompt_tokens = T, completion_tokens,
-                total_tokens = T + completion_tokens)))
+                total_tokens = T + completion_tokens),
+            vallmo))
     end
     finally
         close(out)
