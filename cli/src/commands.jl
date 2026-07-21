@@ -93,6 +93,7 @@ const HELP_LINES = [
     ("↑ ↓ PgUp PgDn", "scroll the transcript (↑↓ move the cursor in a multi-line draft)"),
     ("wheel / drag", "scroll · left-drag selects lines, release copies them"),
     ("Ctrl+W · Ctrl+U", "delete word · delete to line start (opt-/cmd-backspace on macOS)"),
+    ("Opt+← → · Cmd+← →", "word motions · line start/end (also Ctrl+← → and Home/End)"),
     ("Ctrl+L", "clear the conversation"),
     ("", ""),
     ("commands", "type / — fuzzy matched, ↑↓ + Tab + Enter, live preview, Esc reverts"),

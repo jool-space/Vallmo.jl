@@ -104,6 +104,16 @@ function update!(m::VallmoChatModel, evt::KeyEvent)
         _vc_delete_word!(m.input)                # readline: also what most
     elseif evt.key == :ctrl && evt.char == 'u'   # macOS terminals send for
         _vc_delete_bol!(m.input)                 # opt-/cmd-backspace
+    elseif evt.key == :alt_backspace
+        _vc_delete_word!(m.input)
+    elseif evt.key in (:alt_left, :ctrl_left) || (evt.key == :alt && evt.char == 'b')
+        _vc_word_left!(m.input)                  # opt+← arrives as CSI-mod,
+    elseif evt.key in (:alt_right, :ctrl_right) || (evt.key == :alt && evt.char == 'f')
+        _vc_word_right!(m.input)                 # kitty mod, or readline M-b/M-f
+    elseif evt.key == :super_left                # cmd+← (kitty terminals; VS Code
+        handle_key!(m.input, KeyEvent(:home))    # sends Home/End directly, which
+    elseif evt.key == :super_right               # falls through to the input)
+        handle_key!(m.input, KeyEvent(:end_key))
     elseif evt.key in (:pageup, :pagedown)
         handle_key!(m.pane, evt)
     elseif evt.key in (:up, :down)
@@ -166,6 +176,38 @@ function _vc_copy_text(txt::AbstractString)
     flush(stdout)
     clipboard_copy!(String(txt))
     return
+end
+
+# Readline-style motions TextArea doesn't have natively.
+function _vc_word_left!(ta::TextArea)
+    c = ta.cursor_col
+    c == 0 && return handle_key!(ta, KeyEvent(:left))   # wrap to prev line end
+    line = ta.lines[ta.cursor_row]
+    i = c
+    while i > 0 && line[i] == ' '
+        i -= 1
+    end
+    while i > 0 && line[i] != ' '
+        i -= 1
+    end
+    ta.cursor_col = i
+    return true
+end
+
+function _vc_word_right!(ta::TextArea)
+    line = ta.lines[ta.cursor_row]
+    n = length(line)
+    c = ta.cursor_col
+    c >= n && return handle_key!(ta, KeyEvent(:right))  # wrap to next line
+    i = c + 1
+    while i <= n && line[i] == ' '
+        i += 1
+    end
+    while i <= n && line[i] != ' '
+        i += 1
+    end
+    ta.cursor_col = i - 1
+    return true
 end
 
 # Readline-style edits TextArea doesn't have natively.
@@ -352,7 +394,8 @@ function _vc_message_lines!(lines::Vector{Vector{Span}}, role::Symbol,
     else
         for (seg, kind) in _vc_segments(s)
             if kind === :think
-                plain(seg, tstyle(:text_dim, italic=true))
+                seg = strip(seg)                   # empty think → no lines
+                isempty(seg) || plain(seg, tstyle(:text_dim, italic=true))
             else
                 append!(lines, markdown_to_spans(seg, w; text_style=tstyle(:text)))
             end
