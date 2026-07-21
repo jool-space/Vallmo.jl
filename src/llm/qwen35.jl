@@ -143,6 +143,24 @@ function deltanet_layer(lw, cfg)
     ))
 end
 
+"""
+    reset!(m::Qwen35)
+
+Zero the model-level recurrent state — deltanet `S` and `conv_state` —
+which carries across generations (nothing masks it). The K/V caches need
+no reset: attention reads them through `positions`, and prefill overwrites
+the rows it uses.
+"""
+function reset!(m::Qwen35)
+    for l in m.layers
+        if l isa DeltaNetLayer
+            l.S .= 0f0
+            l.conv_state .= zero(eltype(l.conv_state))
+        end
+    end
+    return m
+end
+
 # ── the decode step (the capture target) ─────────────────────────────────────
 
 function decode!(h, l::AttnLayer, m::Qwen35, gen, xn)

@@ -12,6 +12,6 @@ public splitaxis
 include("kernels/kernels.jl")
 
 include("llm/llm.jl")
-public Generation, generate!, generate_captured!, qwen35
+public Generation, generate!, generate_captured!, CaptureSession, reset!, qwen35
 
 end

@@ -137,30 +137,48 @@ function generate!(model, gen::Generation, ids; max_new_tokens,
 end
 
 """
-    generate_captured!(model, gen, ids; max_new_tokens, warmup = 3, kwargs...)
+    CaptureSession()
+
+The captured decode's cross-call state: the instantiated graph and how
+much warmup has been spent. The graph records raw addresses, so it is
+valid for exactly one (model, gen) pair — the same buffers replay
+verbatim whatever tokens they hold. Pass one session to every
+[`generate_captured!`](@ref) against that pair and warmup + capture are
+paid once per process, not once per generation.
+"""
+mutable struct CaptureSession
+    exec   :: Any
+    n_warm :: Int
+end
+CaptureSession() = CaptureSession(nothing, 0)
+
+"""
+    generate_captured!(model, gen, ids; max_new_tokens, warmup = 3,
+                       session = CaptureSession(), kwargs...)
 
 Captured generation (M2): `warmup` eager steps (autotune, plan caches, and
 pool allocations spend themselves), then one (step!; advance!) recorded as a
 CUDA graph and replayed for the remaining tokens. Capture records without
 executing, so warmup's last state flows straight into the first replay.
+The default fresh `session` re-warms and re-captures every call; a served
+model passes its own [`CaptureSession`](@ref) and replays from token 1.
 """
 function generate_captured!(model, gen::Generation, ids; max_new_tokens,
-    warmup = 3, eos = nothing, poll_every = 8, on_tokens = nothing,
+    warmup = 3, session::CaptureSession = CaptureSession(),
+    eos = nothing, poll_every = 8, on_tokens = nothing,
 )
-    exec = nothing
-    n_warm = 0
     function launch_step!()
-        if n_warm < warmup
+        if session.n_warm < warmup
             step!(model, gen); advance!(gen)
-            n_warm += 1
+            session.n_warm += 1
         else
-            if isnothing(exec)
+            if isnothing(session.exec)
                 graph = capture() do
                     step!(model, gen); advance!(gen)
                 end
-                exec = instantiate(graph)
+                session.exec = instantiate(graph)
             end
-            launch(exec)
+            launch(session.exec)
         end
     end
     _run!(model, gen, ids; max_new_tokens, eos, poll_every, on_tokens, launch_step!)
