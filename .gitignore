@@ -3,7 +3,7 @@
 *.jl.mem
 /Manifest*.toml
 /docs/Manifest*.toml
-/serve/Manifest*.toml
+/cli/Manifest*.toml
 /docs/build/
 .CondaPkg
 models

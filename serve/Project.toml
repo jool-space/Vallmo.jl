@@ -1,9 +1,0 @@
-[deps]
-CUDACore = "bd0ed864-bdfe-4181-a5ed-ce625a5fdea2"
-HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
-HuggingFaceTokenizers = "a6888d44-1185-43bb-bd0f-7806f9976d18"
-JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
-Vallmo = "d7e4f3a4-021c-470a-a969-608a99edde6c"
-
-[compat]
-HTTP = "1"

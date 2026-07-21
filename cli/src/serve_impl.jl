@@ -1,7 +1,9 @@
 # server.jl — /v1/chat/completions over the captured decode.
 #
-#     julia -C "native,-avx512bf16" --project=serve serve/server.jl \
-#         [--dir models/Qwen3.5-4B] [--port 8080] [--ctx 4096] [--max-new 2048]
+#     vallmo serve [--dir MODELS] [--port 8080] [--ctx 4096] [--max-new 2048]
+#
+# Loaded lazily by VallmoCLI.serve_cmd — `vallmo chat` never pays for
+# the CUDA stack.
 #
 # One model, one GPU worker, one queue: requests serialize through a
 # `Channel{Job}` into the worker task that owns the model, so the HTTP
@@ -220,7 +222,7 @@ end
 # ── main ─────────────────────────────────────────────────────────────────────
 
 function parse_args(args)
-    cfg = Dict("--dir" => joinpath(@__DIR__, "..", "models", "Qwen3.5-4B"),
+    cfg = Dict("--dir" => joinpath(pkgdir(Vallmo), "models", "Qwen3.5-4B"),
                "--host" => "127.0.0.1", "--port" => "8080",
                "--ctx" => "4096", "--max-new" => "2048")
     for i in 1:2:length(args)
@@ -232,7 +234,7 @@ function parse_args(args)
         max_new = parse(Int, cfg["--max-new"]))
 end
 
-function main(args = ARGS)
+function _serve_main(args)
     cfg = parse_args(args)
     @info "loading tokenizer…"
     tok = Tokenizers.from_file(Tokenizers.Tokenizer, joinpath(cfg.dir, "tokenizer.json"))
@@ -260,4 +262,3 @@ function main(args = ARGS)
     end
 end
 
-(abspath(PROGRAM_FILE) == @__FILE__) && main()

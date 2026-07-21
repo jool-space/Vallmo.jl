@@ -1,0 +1,28 @@
+name = "VallmoCLI"
+uuid = "f3fde6a5-f68d-4bc0-b850-98e33747bbaf"
+version = "0.1.0"
+authors = ["AntonOresten <antonoresten@proton.me> and contributors"]
+
+[deps]
+Base64 = "2a0f44e3-6c83-55bd-87e4-b1978d98bd5f"
+CUDACore = "bd0ed864-bdfe-4181-a5ed-ce625a5fdea2"
+CommonMark = "a80b9123-70ca-4bc0-993e-6e3bcb318db6"
+HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
+HuggingFaceTokenizers = "a6888d44-1185-43bb-bd0f-7806f9976d18"
+JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
+Tachikoma = "468859d6-42d8-48b7-8ad9-1d312e0e3b0a"
+Vall = "7bc0144c-90d3-4101-a4aa-c305a24a927e"
+Vallmo = "d7e4f3a4-021c-470a-a969-608a99edde6c"
+cuBLASLt = "448fee3d-7d89-4b6e-8554-2e2b5f03afa7"
+
+[sources]
+Tachikoma = {path = "../../Tachikoma"}
+Vall = {path = "../../Vall"}
+Vallmo = {path = ".."}
+
+[compat]
+HTTP = "1"
+julia = "1.12"
+
+[apps.vallmo]
+julia_flags = ["-C", "native,-avx512bf16", "-t", "4"]
