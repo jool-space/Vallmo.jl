@@ -446,14 +446,13 @@ function _render_poppy_braille!(pixels::Matrix{ColorRGBA}, zbuf::Matrix{Float64}
             end
             color = _poppy_term_color(fade < 1.0 ? _poppy_tint(best, fade) : best,
                                       truecolor)
-            # Coverage falloff: smoothstep with a faint floor. sqrt made
-            # sparse rim cells blocky; quadratic starved the mid-range
-            # (3-4 dots nearly bare). The S-curve keeps half-covered
-            # cells washed (~50%), rolls through the mid, and drops hard
-            # only at 1-2 dots -- where the floor leaves just enough halo
-            # to seat a lone dot without a visible square.
-            cov = (ndots / 8)^2 * (3 - 2 * ndots / 8)
-            tint = _poppy_tint(best, 0.38 * fade * (0.06 + 0.94 * cov))
+            # Coverage falloff: smoothstep^0.6 -- an S-curve softened
+            # toward the middle. sqrt made sparse cells blocky, quadratic
+            # starved the mid-range, plain smoothstep still stepped too
+            # hard; this keeps lone dots at a faint seat-halo (~15%)
+            # while half-covered cells hold a generous wash (~2/3).
+            cov = ((ndots / 8)^2 * (3 - 2 * ndots / 8))^0.6
+            tint = _poppy_tint(best, 0.38 * fade * cov)
             tints[cy, cx] = tint
             style = if bg == :cover
                 Style(fg=color, bg=_poppy_term_color(tint, truecolor))
