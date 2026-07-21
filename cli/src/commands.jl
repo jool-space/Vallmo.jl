@@ -220,32 +220,41 @@ end
 
 function _vc_cmd_popup!(m, buf, above::Rect, st)
     rows = if st.cmd === nothing
-        [(c.name * (isempty(c.argspec) ? "" : " " * c.argspec),
-          c.desc * "  ·  " * c.current(m), c.name)
+        [("/" * c.name * (isempty(c.argspec) ? "" : " " * c.argspec),
+          c.desc * "  ·  " * c.current(m))
          for c in (CHAT_COMMANDS[findfirst(x -> x.name == name, CHAT_COMMANDS)]
                    for name in st.suggestions)]
     elseif !isempty(st.suggestions)
-        [(o, "", o) for o in st.suggestions]
+        [("/" * st.cmd.name * " " * o, "") for o in st.suggestions]
     else
-        [(st.cmd.name * " " * st.cmd.argspec,
-          st.cmd.desc * "  ·  " * st.cmd.current(m), nothing)]
+        [("/" * st.cmd.name * " " * st.cmd.argspec,
+          st.cmd.desc * "  ·  " * st.cmd.current(m))]
     end
-    isempty(rows) && (rows = [("no matching command", "", nothing)])
-    h = min(length(rows), 6, above.height)
+    isempty(rows) && (rows = [("no matching command", "")])
+    n = length(rows)
+    h = min(n, 6, above.height)
+    # Window the list so the selection stays visible past h rows
+    sel = clamp(m.cmd_sel, 1, n)
+    lo = clamp(sel - h + 1, 1, max(1, n - h + 1))
+    lo = min(lo, max(1, sel))            # selection never above the window
     top = bottom(above) - h + 1
     base = light_mode() ? SLATE.c200 : SLATE.c800
     selbg = light_mode() ? SLATE.c300 : SLATE.c700
-    for (k, y) in zip(1:h, top:bottom(above))
-        label, desc, _ = rows[k]
-        selected = k == clamp(m.cmd_sel, 1, length(rows))
+    for (k, y) in zip(lo:lo+h-1, top:bottom(above))
+        label, desc = rows[k]
+        selected = k == sel
         bg = selected ? selbg : base
         set_string!(buf, above.x, y, " "^above.width, Style(bg = bg))
-        set_string!(buf, above.x + 1, y, "/" * label,
-                    Style(fg = tstyle(:accent).fg, bg = bg,
-                          bold = selected))
+        # Off-window hints on the edge rows
+        marker = (k == lo && lo > 1) ? "▲" :
+                 (k == lo + h - 1 && lo + h - 1 < n) ? "▼" : " "
+        set_string!(buf, right(above) - 1, y, marker,
+                    Style(fg = tstyle(:text_dim).fg, bg = bg))
+        set_string!(buf, above.x + 1, y, label,
+                    Style(fg = tstyle(:accent).fg, bg = bg, bold = selected))
         isempty(desc) ||
-            set_string!(buf, above.x + 3 + length(label) + 2, y,
-                        first(desc, max(above.width - length(label) - 7, 0)),
+            set_string!(buf, above.x + 1 + length(label) + 2, y,
+                        first(desc, max(above.width - length(label) - 6, 0)),
                         Style(fg = tstyle(:text_dim).fg, bg = bg))
     end
     return
