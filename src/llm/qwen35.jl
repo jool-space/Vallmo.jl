@@ -44,9 +44,11 @@ Base.getproperty(l::Layer, s::Symbol) =
     s === :w ? getfield(l, :w) : getproperty(getfield(l, :w), s)
 Base.propertynames(l::Layer) = propertynames(getfield(l, :w))
 
-struct Qwen35{CFG,E,NW,R,L,SP}
+struct Qwen35{CFG,E,H,NW,R,L,SP}
     cfg    :: CFG       # parsed text_config as a NamedTuple
-    E      :: E         # (D, vocab) BF16 — embedding AND lm head (tied)
+    E      :: E         # (D, vocab) BF16 — the embedding
+    head   :: H         # (D, vocab) — lm head: E itself when tied (4B),
+                        #   the checkpoint's own lm_head.weight when not (9B)
     norm_w :: NW        # (D,) final norm
     rope   :: R         # (; cos, sin) :: (HALF_ROT, Ctx) Float32
     layers :: L         # Vector{Union{AttnLayer, DeltaNetLayer}} (union-split)
@@ -58,7 +60,10 @@ end
 # ── load ─────────────────────────────────────────────────────────────────────
 
 function qwen35(dir::AbstractString; Ctx::Int, B::Int, arena_bytes::Int = 64 << 20)
-    tc = JSON.parsefile(joinpath(expanduser(dir), "config.json"))["text_config"]
+    cj = JSON.parsefile(joinpath(expanduser(dir), "config.json"))
+    tc = cj["text_config"]
+    tied = something(get(cj, "tie_word_embeddings", nothing),
+                     get(tc, "tie_word_embeddings", nothing), false)
     cfg = (;
         D    = Int(tc["hidden_size"]),
         eps  = Float32(tc["rms_norm_eps"]),
@@ -77,15 +82,17 @@ function qwen35(dir::AbstractString; Ctx::Int, B::Int, arena_bytes::Int = 64 << 
 
     st = SafeTensors(checkpoint_shards(expanduser(dir)))
     GC.@preserve st begin   # tree's leaves alias st's mmaps; every cu() reads them
-        w = tree(st).model.language_model
-        E = cu(w.embed_tokens.weight)                    # (D, vocab), tied head
+        full = tree(st)
+        w = full.model.language_model
+        E = cu(w.embed_tokens.weight)                    # (D, vocab)
+        head = tied ? E : cu(full.lm_head.weight)        # untied: own tensor
 
         layers = map(collect(enumerate(w.layers))) do (i, lw)
             cfg.layer_types[i] == "full_attention" ?
                 attn_layer(lw, cfg) : deltanet_layer(lw, cfg)
         end
 
-        return Qwen35(cfg, E, cu(w.norm.weight), rope_tables(cfg), layers,
+        return Qwen35(cfg, E, head, cu(w.norm.weight), rope_tables(cfg), layers,
                       Arena(CuVector{UInt8}(undef, arena_bytes)),
                       Int32(tc["eos_token_id"] + 1))
     end
@@ -244,7 +251,7 @@ function step!(m::Qwen35, gen)
             fused_add_rms_norm!((; Y = xn, X′ = x), x, h, next_w; eps, offset = 1f0)
         end
 
-        lm_head_argmax!((; Result = gen.result), xn, m.E)   # scratch: step frame
+        lm_head_argmax!((; Result = gen.result), xn, m.head)   # scratch: step frame
     end
     return
 end
@@ -368,7 +375,7 @@ function prefill!(m::Qwen35, gen, ids; offset::Int = 0)
     end
 
     xlast = view(reshape(xn, (D, T, B)), :, T, :)        # uniform T; ragged is M2+
-    lm_head_argmax!((; Result = gen.result), xlast, m.E)
+    lm_head_argmax!((; Result = gen.result), xlast, m.head)
     gen.positions .= Int32(offset + T + 1)               # the final act: seed the clock
     return
 end

@@ -66,7 +66,7 @@ function serve_worker(model, gen, tok, session, jobs)
             ids_h = vec(job.ids)
             Tc = length(cached)
             hit = snap !== nothing && 0 < Tc < length(ids_h) &&
-                  view(ids_h, 1:Tc) == cached
+                  Base.view(ids_h, 1:Tc) == cached   # Base.: Tachikoma claims `view`
             if hit
                 Vallmo.restore!(model, snap)
             else
@@ -243,10 +243,41 @@ function _serve_main(args)
     @info "model loaded" seconds = round(t; digits = 1)
 
     gen = Generation(1, cfg.max_new)
+    session = CaptureSession()
+
+    # Warm before listening: the first generation ever pays the cuTile
+    # prefill-kernel compiles (one per shape/divisibility class), the
+    # cuBLASLt plan sieve, eager warmup decode steps, and graph capture
+    # — ~25 s that has nothing to do with any real prompt. Spend it at
+    # boot on synthetic prompts covering the shape classes (odd, /2, /4,
+    # /8, /16 — full and suffix prefill both), so the first request pays
+    # only its own prefill and replays the graph.
+    @info "warming up (kernel compiles, plan sieve, graph capture)…"
+    wids(T) = CUDACore.CuMatrix{Int32}(fill(Int32(5), T, 1))
+    t = @elapsed begin
+        for T in (17, 18, 20, 24, 32)
+            Vallmo.reset!(model)
+            generate_captured!(model, gen, wids(T); session,
+                max_new_tokens = 4, warmup = 3)
+        end
+        snap = Ref{Any}(nothing)
+        Vallmo.reset!(model)
+        generate_captured!(model, gen, wids(17); session, max_new_tokens = 4,
+            on_prefilled = () -> (snap[] = Vallmo.snapshot(model)))
+        for Ts in (19, 20, 22, 26, 31)          # suffix classes, offset 17
+            Vallmo.restore!(model, snap[])
+            generate_captured!(model, gen, wids(Ts); session,
+                max_new_tokens = 4, prefill_offset = 17)
+        end
+        Vallmo.reset!(model)
+        CUDACore.synchronize()
+    end
+    @info "warm" seconds = round(t; digits = 1)
+
     jobs = Channel{Job}(16)
     st = (; tok, jobs, cfg.ctx, cfg.max_new, counter = Ref(0),
         model_id = basename(cfg.dir), created = round(Int, time()))
-    errormonitor(@async serve_worker(model, gen, tok, CaptureSession(), jobs))
+    errormonitor(@async serve_worker(model, gen, tok, session, jobs))
 
     @info "serving" cfg.host cfg.port
     HTTP.serve(cfg.host, cfg.port; stream = true) do http
