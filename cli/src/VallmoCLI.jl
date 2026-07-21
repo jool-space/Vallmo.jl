@@ -19,13 +19,16 @@ using HTTP, JSON
 using Base64: base64encode
 
 include("poppy_render.jl")
+include("commands.jl")
 include("chat.jl")
 
 const USAGE = """
 vallmo — Qwen3.5 on the jool stack: server and chat client
 
-  vallmo [chat] [--url http://127.0.0.1:8080] [--fade 0.75] [--theme NAME]
+  vallmo [chat] [--url http://127.0.0.1:8080]
       The poppy chat client. The flower blooms while the model streams.
+      Settings live in-chat: type `/` for fuzzy-matched commands
+      (/fade, /theme, /url, /model, /maxtokens, /clear) with live preview.
 
   vallmo serve [--dir MODELS_DIR] [--host 127.0.0.1] [--port 8080]
                [--ctx 4096] [--max-new 2048]
@@ -35,16 +38,13 @@ vallmo — Qwen3.5 on the jool stack: server and chat client
 """
 
 function chat_cmd(args)
-    opts = Dict("--url" => "http://127.0.0.1:8080", "--fade" => "0.75",
-                "--theme" => "")
+    opts = Dict("--url" => "http://127.0.0.1:8080")
     for i in 1:2:length(args)
         haskey(opts, args[i]) || (println(stderr, "vallmo chat: unknown flag $(args[i])"); return 1)
         i + 1 <= length(args) || (println(stderr, "vallmo chat: $(args[i]) needs a value"); return 1)
         opts[args[i]] = args[i+1]
     end
-    theme = isempty(opts["--theme"]) ? nothing : Symbol(opts["--theme"])
-    chat(; base_url = opts["--url"], fade = parse(Float64, opts["--fade"]),
-         theme_name = theme)
+    chat(; base_url = opts["--url"])
     return 0
 end
 

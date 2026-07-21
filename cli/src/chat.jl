@@ -45,6 +45,11 @@
     shown_off::Int = 0                   # pane offset at last render
     pane_rect::Rect = Rect()
     smooth::Matrix{ColorRGBA} = Matrix{ColorRGBA}(undef, 0, 0)  # per-cell color EMA
+    max_tokens::Int = 0                  # 0 = let the server default
+    # slash-command mode (see commands.jl)
+    cmd_sel::Int = 1
+    cmd_last::String = ""
+    cmd_revert::Union{Nothing,NamedTuple} = nothing
 end
 
 should_quit(m::VallmoChatModel) = m.quit
@@ -56,6 +61,13 @@ function init!(m::VallmoChatModel, ::Terminal)
 end
 
 function update!(m::VallmoChatModel, evt::KeyEvent)
+    # Command mode owns navigation/confirm/cancel while the input is "/…"
+    if evt.key != :ctrl_c
+        cmdline = _vc_cmdline(m)
+        if cmdline !== nothing && evt.key in (:up, :down, :tab, :enter, :escape)
+            _vc_cmd_key!(m, evt, cmdline) && return
+        end
+    end
     if evt.key == :ctrl_c
         m.quit = true
     elseif evt.key == :escape
@@ -83,10 +95,6 @@ function update!(m::VallmoChatModel, evt::KeyEvent)
                                     handle_key!(m.pane, evt)
     elseif evt.key == :ctrl && evt.char == 'l'
         m.streaming || (empty!(m.messages); m.status = ""; m.built_n = -1)
-    elseif evt.key == :ctrl && evt.char == 'f'
-        fades = (1.0, 0.85, 0.75, 0.6, 0.45)
-        m.fade = fades[mod1(something(findfirst(==(m.fade), fades), 2) + 1,
-                            length(fades))]
     else
         handle_key!(m.input, evt)
     end
@@ -159,7 +167,7 @@ end
 
 function _vc_submit!(m::VallmoChatModel)
     txt = strip(text(m.input))
-    isempty(txt) && return
+    (isempty(txt) || startswith(txt, "/")) && return
     push!(m.messages, (:user, String(txt)))
     set_text!(m.input, "")
     m.live = ""
@@ -168,8 +176,10 @@ function _vc_submit!(m::VallmoChatModel)
     m.pane.following = true
     m.cancel = CancelToken()
     history = [Dict("role" => String(r), "content" => c) for (r, c) in m.messages]
-    body = JSON.json(Dict("model" => m.model_id, "messages" => history,
-                          "stream" => true))
+    req = Dict{String,Any}("model" => m.model_id, "messages" => history,
+                           "stream" => true)
+    m.max_tokens > 0 && (req["max_tokens"] = m.max_tokens)
+    body = JSON.json(req)
     url, ch, tok = m.base_url * "/v1/chat/completions", m.deltas, m.cancel
     Threads.@spawn _vc_stream(url, body, ch, tok)
 end
@@ -330,6 +340,16 @@ function view(m::VallmoChatModel, f::Frame)
     area = f.area
     (area.width < 24 || area.height < 8) && return
 
+    # Slash-command mode: preview live settings; restore if "/" was erased
+    cmdline = _vc_cmdline(m)
+    cmd_st = nothing
+    if cmdline === nothing
+        m.cmd_revert === nothing || _vc_cmd_restore!(m)
+        m.cmd_last = ""
+    else
+        cmd_st = _vc_cmd_frame!(m, cmdline)
+    end
+
     # The generation indicator: the bud opens as tokens actually arrive
     # (not on submit — prefill wait keeps it closed) and folds shut 3 s
     # after the last one. `open_until` is refreshed by every delta.
@@ -416,11 +436,16 @@ function view(m::VallmoChatModel, f::Frame)
     m.input.tick = m.tick
     render(m.input, Rect(inputrow.x + 3, inputrow.y,
                          inputrow.width - 3, inputrow.height), buf)
-    hints = m.streaming ? " [Esc]stop [PgUp/wheel]scroll [drag]copy [^F]fade" :
-        " [Enter]send [^J]newline [Esc]quit [^L]clear [drag]copy [^F]fade"
+    hints = m.streaming ? " [Esc]stop [PgUp/wheel]scroll [drag]copy [/]settings" :
+        " [Enter]send [^J]newline [/]settings [Esc]quit [^L]clear [drag]copy"
     left = isempty(m.status) ? hints : " ⚠ $(m.status)"
     set_string!(buf, footer.x + 1, footer.y, first(left, area.width - 2),
                 isempty(m.status) ? tstyle(:text_dim, dim=true) : tstyle(:error))
+
+    # Command popup, riding just above the separator
+    cmd_st === nothing ||
+        _vc_cmd_popup!(m, buf, Rect(main.x + 1, main.y, main.width - 2,
+                                    main.height), cmd_st)
 
     # Selection highlight: whole lines between anchor and head.
     if m.sel_anchor != 0
