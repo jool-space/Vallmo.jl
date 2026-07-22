@@ -32,12 +32,27 @@ function _vc_apply_theme!(arg::AbstractString)
     error("unknown theme '$arg'")
 end
 
+# /thinking: show/hide is display-only; on/off rides the request as
+# `enable_thinking` — off has the server prefill an empty think block,
+# so the model skips thinking entirely (see serve_impl.render_chat).
+function _vc_thinking!(m, arg)
+    if arg in ("show", "hide")
+        m.show_think = (arg == "show")
+        m.built_n = -1
+    elseif arg in ("on", "off")
+        m.think_enabled = (arg == "on")
+    else
+        error("expected show, hide, on or off")
+    end
+    return "thinking $arg"
+end
+
 const CHAT_COMMANDS = ChatCommand[
-    ChatCommand("fade", "<0.2–1.0>",
-        "flower presence — 1.0 full color, lower recedes into the canvas",
+    ChatCommand("fade", "<0.0–1.0>",
+        "flower presence — 1.0 full color, lower recedes, 0.0 hides it",
         m -> string(m.fade),
-        m -> ["1.0", "0.85", "0.75", "0.6", "0.45"],
-        (m, arg) -> (m.fade = clamp(parse(Float64, arg), 0.05, 1.0);
+        m -> ["1.0", "0.85", "0.75", "0.6", "0.45", "0.0"],
+        (m, arg) -> (m.fade = clamp(parse(Float64, arg), 0.0, 1.0);
                      "fade $(m.fade)"),
         true),
     ChatCommand("theme", "<name>",
@@ -45,6 +60,13 @@ const CHAT_COMMANDS = ChatCommand[
         m -> theme().name,
         m -> _vc_theme_names(),
         (m, arg) -> (_vc_apply_theme!(arg); m.built_n = -1; "theme $(arg)"),
+        true),
+    ChatCommand("thinking", "<show|hide|on|off>",
+        "show/hide think text · on/off asks the server to skip thinking",
+        m -> (m.show_think ? "show" : "hide") * " · " *
+             (m.think_enabled ? "on" : "off"),
+        m -> ["show", "hide", "on", "off"],
+        (m, arg) -> _vc_thinking!(m, arg),
         true),
     ChatCommand("url", "<base_url>",
         "the /v1/chat/completions server to talk to",
@@ -66,10 +88,10 @@ const CHAT_COMMANDS = ChatCommand[
                      "maxtokens $(m.max_tokens == 0 ? "server default" : m.max_tokens)"),
         false),
     ChatCommand("clear", "",
-        "clear the conversation",
+        "clear the conversation (cancels a streaming reply too)",
         m -> "$(length(m.messages)) messages",
         m -> String[],
-        (m, _) -> (empty!(m.messages); m.built_n = -1; "cleared"),
+        (m, _) -> (_vc_clear!(m); "cleared"),
         false),
     ChatCommand("help", "",
         "keys and commands (any key closes)",
@@ -89,6 +111,7 @@ const HELP_LINES = [
     ("keys", ""),
     ("Enter", "send — end a line with \\ to continue on a new line"),
     ("Esc", "dismiss/cancel: selection → command → stream (keeps partial) → quit"),
+    ("Ctrl+C", "streaming: cancel, prompt returns as a draft · idle: quit"),
     ("Ctrl+D", "quit on an empty draft · delete forward otherwise"),
     ("↑ ↓ PgUp PgDn", "scroll the transcript (↑↓ move the cursor in a multi-line draft)"),
     ("wheel / drag", "scroll · left-drag selects lines, release copies them"),
@@ -186,13 +209,16 @@ end
 function _vc_cmd_snapshot!(m)
     m.cmd_revert === nothing || return
     m.cmd_revert = (; fade = m.fade, theme = theme(),
-                    light = light_mode())
+                    light = light_mode(), show_think = m.show_think,
+                    think_enabled = m.think_enabled)
 end
 
 function _vc_cmd_restore!(m)
     r = m.cmd_revert
     r === nothing && return
     m.fade = r.fade
+    m.show_think = r.show_think
+    m.think_enabled = r.think_enabled
     set_light_mode!(r.light)
     set_theme!(r.theme)
     m.built_n = -1
@@ -243,13 +269,25 @@ function _vc_cmd_key!(m, evt::KeyEvent, cmdline::String)
     return false
 end
 
+# Which settings key(s) a committed command overrides (persisted); only
+# those keys land in settings.json, so untouched options keep tracking
+# code defaults.
+_vc_persist_keys(name::String, arg::String) =
+    name == "thinking" ? (arg in ("show", "hide") ? ["thinking_show"] :
+                                                    ["thinking_enabled"]) :
+    name in ("fade", "theme", "url", "model", "maxtokens") ? [name] :
+    String[]
+
 function _vc_cmd_run!(m, c::ChatCommand, arg::String)
     m.cmd_revert = nothing            # committing: nothing to restore
+    ok = true
     m.status = try
         c.apply!(m, arg)
     catch err
+        ok = false
         "/$(c.name): $(sprint(showerror, err))"
     end
+    ok && _vc_save_settings(m, _vc_persist_keys(c.name, arg))
     set_text!(m.input, "")
     m.cmd_sel = 1
     return

@@ -1,6 +1,7 @@
 # server.jl — /v1/chat/completions over the captured decode.
 #
-#     vallmo serve [--dir MODELS] [--port 8080] [--ctx 4096] [--max-new 2048]
+#     vallmo serve [--dir MODELS|model.gguf] [--tokenizer tokenizer.json]
+#                  [--port 8080] [--ctx 4096] [--max-new 2048]
 #
 # Loaded lazily by VallmoCLI.serve_cmd — `vallmo chat` never pays for
 # the CUDA stack.
@@ -28,7 +29,10 @@ content_text(parts::AbstractVector) =
 # History never carries thought: the template strips assistant think blocks.
 strip_think(s) = replace(s, r"<think>.*?</think>\s*"s => "")
 
-function render_chat(messages)
+# enable_think=false prefills an empty think block after the assistant
+# header — the model sees thinking as already over and answers directly
+# (the same trick the official template's enable_thinking=false uses).
+function render_chat(messages; enable_think::Bool=true)
     io = IOBuffer()
     for m in messages
         role = m["role"]
@@ -37,6 +41,7 @@ function render_chat(messages)
         print(io, "<|im_start|>", role, "\n", text, "<|im_end|>\n")
     end
     print(io, "<|im_start|>assistant\n")
+    enable_think || print(io, "<think>\n\n</think>\n\n")
     return String(take!(io))
 end
 
@@ -138,7 +143,8 @@ end
 
 function handle_chat(http, st)
     body = JSON.parse(String(read(http)))
-    prompt = render_chat(body["messages"])
+    prompt = render_chat(body["messages"];
+                         enable_think = get(body, "enable_thinking", true) === true)
     ids = Tokenizers.encode(st.tok, prompt).ids .+ 1     # 0-based → 1-based
     T = length(ids)
     room = st.ctx - T - 1
@@ -224,20 +230,35 @@ end
 function parse_args(args)
     cfg = Dict("--dir" => joinpath(pkgdir(Vallmo), "models", "Qwen3.5-4B"),
                "--host" => "127.0.0.1", "--port" => "8080",
-               "--ctx" => "4096", "--max-new" => "2048")
+               "--ctx" => "4096", "--max-new" => "2048",
+               "--tokenizer" => "")
     for i in 1:2:length(args)
         haskey(cfg, args[i]) || error("unknown flag $(args[i]); knows $(keys(cfg))")
         cfg[args[i]] = args[i+1]
     end
     return (; dir = abspath(expanduser(cfg["--dir"])), host = cfg["--host"],
         port = parse(Int, cfg["--port"]), ctx = parse(Int, cfg["--ctx"]),
-        max_new = parse(Int, cfg["--max-new"]))
+        max_new = parse(Int, cfg["--max-new"]),
+        tokenizer = isempty(cfg["--tokenizer"]) ? nothing :
+                    abspath(expanduser(cfg["--tokenizer"])))
+end
+
+# GGUF holds its tokenizer in ggml's own representation (tokens/merges in
+# metadata), which we don't reconstruct into the tokenizer.json the
+# tokenizers library wants. Resolution order: --tokenizer flag, then
+# tokenizer.json in the checkpoint directory / beside the .gguf.
+function load_tokenizer(dir, tokenizer)
+    path = something(tokenizer,
+        joinpath(isfile(dir) ? dirname(dir) : dir, "tokenizer.json"))
+    isfile(path) ||
+        error("no tokenizer at $path — pass --tokenizer path/to/tokenizer.json")
+    return Tokenizers.from_file(Tokenizers.Tokenizer, path)
 end
 
 function _serve_main(args)
     cfg = parse_args(args)
     @info "loading tokenizer…"
-    tok = Tokenizers.from_file(Tokenizers.Tokenizer, joinpath(cfg.dir, "tokenizer.json"))
+    tok = load_tokenizer(cfg.dir, cfg.tokenizer)
     @info "loading model…" cfg.dir cfg.ctx
     t = @elapsed model = qwen35(cfg.dir; Ctx = cfg.ctx, B = 1)
     @info "model loaded" seconds = round(t; digits = 1)
@@ -276,7 +297,8 @@ function _serve_main(args)
 
     jobs = Channel{Job}(16)
     st = (; tok, jobs, cfg.ctx, cfg.max_new, counter = Ref(0),
-        model_id = basename(cfg.dir), created = round(Int, time()))
+        model_id = replace(basename(cfg.dir), r"\.gguf$" => ""),
+        created = round(Int, time()))
     errormonitor(@async serve_worker(model, gen, tok, session, jobs))
 
     @info "serving" cfg.host cfg.port

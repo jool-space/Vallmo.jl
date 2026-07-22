@@ -5,7 +5,7 @@ The `vallmo` command — Julia app (1.12) wrapping the jool stack's Qwen3.5
 serving loop and its poppy-fronted chat client.
 
     vallmo chat  [--url …] [--fade …] [--theme …]
-    vallmo serve [--dir …] [--host …] [--port …] [--ctx …] [--max-new …]
+    vallmo serve [--dir …] [--tokenizer …] [--host …] [--port …] [--ctx …] [--max-new …]
 
 `chat` is the default command and loads only the TUI stack; `serve`
 lazily imports Vallmo and the CUDA packages, so the client stays snappy
@@ -32,15 +32,16 @@ vallmo — Qwen3.5 on the jool stack: server and chat client
       Settings live in-chat: type `/` for fuzzy-matched commands
       (/fade, /theme, /url, /model, /maxtokens, /clear) with live preview.
 
-  vallmo serve [--dir MODELS_DIR] [--host 127.0.0.1] [--port 8080]
-               [--ctx 4096] [--max-new 2048]
+  vallmo serve [--dir MODELS_DIR|model.gguf] [--tokenizer tokenizer.json]
+               [--host 127.0.0.1] [--port 8080] [--ctx 4096] [--max-new 2048]
       /v1/chat/completions over captured decode with prefix caching.
 
   vallmo help
 """
 
 function chat_cmd(args)
-    opts = Dict("--url" => "http://127.0.0.1:8080")
+    # nothing = flag not given → saved settings (then defaults) apply
+    opts = Dict{String,Union{Nothing,String}}("--url" => nothing)
     for i in 1:2:length(args)
         haskey(opts, args[i]) || (println(stderr, "vallmo chat: unknown flag $(args[i])"); return 1)
         i + 1 <= length(args) || (println(stderr, "vallmo chat: $(args[i]) needs a value"); return 1)

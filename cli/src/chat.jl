@@ -30,8 +30,10 @@
     cancel::Union{CancelToken,Nothing} = nothing
     input::TextArea = TextArea(text="", label="", focused=true)
     pane::ScrollPane = ScrollPane(Vector{Span}[]; following=true)
-    open_until::Int = 0                  # bloom stays open until this tick
-    fade::Float64 = 0.75                 # flower presence: 1.0 = full, lower = ambience
+    open_until::Int = 0                  # "actively streaming" until this tick
+    opened::Bool = false                 # bud has opened; only clear closes it
+    spin::Float64 = 1/4                  # eased speed factor: 1 streaming, 1/4 at rest
+    fade::Float64 = 0.0                  # flower presence: 1.0 = full, 0.0 = hidden
     built::Vector{Vector{Span}} = Vector{Span}[]   # finished messages, memoized
     built_n::Int = 0                     # messages count the memo covers
     built_w::Int = 0                     # width the memo was wrapped for
@@ -46,7 +48,14 @@
     pane_rect::Rect = Rect()
     smooth::Matrix{ColorRGBA} = Matrix{ColorRGBA}(undef, 0, 0)  # per-cell color EMA
     max_tokens::Int = 0                  # 0 = let the server default
+    show_think::Bool = false             # false: replace think text with a spinner line
+    think_enabled::Bool = true           # false: server prefills an empty think block
     show_help::Bool = false              # /help panel; any key dismisses
+    # prompt history (this session): ↑↓ prefix-search over past inputs
+    history::Vector{String} = String[]
+    hist_idx::Int = 0                    # index being shown (0 = not walking)
+    hist_prefix::String = ""             # prefix captured when the walk began
+    hist_draft::String = ""              # in-progress draft, restored on ↓ past newest
     # slash-command mode (see commands.jl)
     cmd_sel::Int = 1
     cmd_last::String = ""
@@ -66,6 +75,8 @@ function update!(m::VallmoChatModel, evt::KeyEvent)
         m.show_help = false
         return
     end
+    # Any key but ↑↓ ends a history walk; the next ↑ re-captures the prefix
+    evt.key in (:up, :down) || (m.hist_idx = 0)
     # Command mode owns navigation/confirm/cancel while the input is "/…"
     if evt.key != :ctrl_c
         cmdline = _vc_cmdline(m)
@@ -74,7 +85,17 @@ function update!(m::VallmoChatModel, evt::KeyEvent)
         end
     end
     if evt.key == :ctrl_c
-        m.quit = true
+        # Mid-stream: abort the exchange and reclaim the prompt as a
+        # draft (the partial reply is dropped). Idle: quit as usual.
+        if m.streaming
+            _vc_cancel!(m)
+            if !isempty(m.messages) && m.messages[end][1] === :user
+                set_text!(m.input, m.messages[end][2])
+                pop!(m.messages)
+            end
+        else
+            m.quit = true
+        end
     elseif evt.key == :escape
         if m.selecting || m.sel_anchor != 0
             m.selecting = false
@@ -117,11 +138,15 @@ function update!(m::VallmoChatModel, evt::KeyEvent)
     elseif evt.key in (:pageup, :pagedown)
         handle_key!(m.pane, evt)
     elseif evt.key in (:up, :down)
-        # a multi-line draft owns ↑↓ for cursor movement; else they scroll
-        length(m.input.lines) > 1 ? handle_key!(m.input, evt) :
-                                    handle_key!(m.pane, evt)
+        # a multi-line draft owns ↑↓ for cursor movement; on a single line
+        # they walk prompt history (prefix search), scrolling as fallback
+        if length(m.input.lines) > 1
+            handle_key!(m.input, evt)
+        else
+            _vc_history!(m, evt.key == :up ? -1 : 1) || handle_key!(m.pane, evt)
+        end
     elseif evt.key == :ctrl && evt.char == 'l'
-        m.streaming || (empty!(m.messages); m.status = ""; m.built_n = -1)
+        _vc_clear!(m)
     else
         handle_key!(m.input, evt)
     end
@@ -235,11 +260,59 @@ function _vc_delete_bol!(ta::TextArea)
     return true
 end
 
+# Shell-style prompt history over this session's submitted messages.
+# ↑ recalls the most recent entry starting with what's typed ("he" ↑ →
+# "hey"); repeated ↑ walks older matches, ↓ walks back and past the
+# newest match restores the stashed draft. Any other key ends the walk
+# (update! resets hist_idx), so the next ↑ captures a fresh prefix.
+# Returns false when there is nothing to recall — ↑↓ then fall through
+# to transcript scrolling.
+function _vc_history!(m::VallmoChatModel, dir::Int)
+    if m.hist_idx == 0
+        dir > 0 && return false                  # ↓ outside a walk
+        m.hist_draft = text(m.input)
+        m.hist_prefix = m.hist_draft
+        m.hist_idx = length(m.history) + 1
+    end
+    cur = text(m.input)
+    i = m.hist_idx + dir
+    while 1 <= i <= length(m.history)
+        h = m.history[i]
+        startswith(h, m.hist_prefix) && h != cur && break
+        i += dir
+    end
+    if i < 1                                     # already at the oldest match
+        m.hist_idx == length(m.history) + 1 && (m.hist_idx = 0)
+        return m.hist_idx != 0
+    elseif i > length(m.history)                 # ↓ past the newest → draft
+        set_text!(m.input, m.hist_draft)
+        m.hist_idx = 0
+    else
+        set_text!(m.input, m.history[i])
+        m.hist_idx = i
+    end
+    return true
+end
+
 # ── Streaming ───────────────────────────────────────────────────────
+
+# Sent as the first message of every request; never shown in the
+# transcript. A constant prefix, so the server's prefix cache keeps
+# paying off across turns.
+const SYSTEM_PROMPT = """
+    You are Vallmo (Swedish word meaning 'Poppy'), a \
+    helpful poppy. A detailed poppy rendering of you \
+    is displayed in the background of the terminal chat interface, \
+    blooming as the conversation begins. \
+    Since the visual representation is already present, \
+    please avoid the use of emojis. \
+    Be yourself: helpful first, flower second."""
 
 function _vc_submit!(m::VallmoChatModel)
     txt = strip(text(m.input))
     (isempty(txt) || startswith(txt, "/")) && return
+    (isempty(m.history) || m.history[end] != txt) && push!(m.history, String(txt))
+    m.hist_idx = 0
     push!(m.messages, (:user, String(txt)))
     set_text!(m.input, "")
     m.live = ""
@@ -247,9 +320,11 @@ function _vc_submit!(m::VallmoChatModel)
     m.streaming = true
     m.pane.following = true
     m.cancel = CancelToken()
-    history = [Dict("role" => String(r), "content" => c) for (r, c) in m.messages]
+    history = vcat(Dict("role" => "system", "content" => SYSTEM_PROMPT),
+                   [Dict("role" => String(r), "content" => c) for (r, c) in m.messages])
     req = Dict{String,Any}("model" => m.model_id, "messages" => history,
-                           "stream" => true)
+                           "stream" => true,
+                           "enable_thinking" => m.think_enabled)
     m.max_tokens > 0 && (req["max_tokens"] = m.max_tokens)
     body = JSON.json(req)
     url, ch, tok = m.base_url * "/v1/chat/completions", m.deltas, m.cancel
@@ -264,12 +339,27 @@ function _vc_stream(url::String, body::String, ch::Channel, tok::CancelToken)
             write(io, body)
             HTTP.closewrite(io)
             HTTP.startread(io)
+            # Cancellation = socket death, by design. The read loop blocks
+            # in eof/readavailable, so it can't poll the token; and any
+            # break/throw out of this block has HTTP.jl drain the rest of
+            # the stream to recycle the connection — the server never sees
+            # a disconnect and generates to max_new. Instead a watcher
+            # closes the connection under the read: the loop dies on the
+            # read error (caught below as a clean cancel) and the server's
+            # next SSE write fails, aborting generation within a token.
+            alive = Ref(true)
+            watcher = @async begin
+                while alive[] && !is_cancelled(tok)
+                    sleep(0.05)
+                end
+                is_cancelled(tok) && alive[] && close(io.stream)
+            end
             # Chunked line assembly: readline-per-byte on an HTTP.Stream
             # is slow, and SSE events may split across chunks.
             pending = ""
             done = false
+            try
             while !done && !eof(io)
-                is_cancelled(tok) && break
                 pending *= String(readavailable(io))
                 while (nl = findfirst('\n', pending)) !== nothing
                     line = rstrip(pending[1:nl-1])
@@ -291,16 +381,41 @@ function _vc_stream(url::String, body::String, ch::Channel, tok::CancelToken)
                     end
                 end
             end
+            finally
+                alive[] = false           # normal end: watcher stands down
+            end
         end
         put!(ch, (:done, nothing))
     catch err
-        put!(ch, (:error, sprint(showerror, err)))
+        # The watcher's socket close surfaces here as a read/stream error;
+        # with the token cancelled that's a clean end, not a failure.
+        is_cancelled(tok) ? put!(ch, (:done, nothing)) :
+                            put!(ch, (:error, sprint(showerror, err)))
     end
+end
+
+# Stop a live stream, dropping the partial. Late events from the dying
+# task are ignored by the drain guards below (streaming is already off).
+function _vc_cancel!(m::VallmoChatModel)
+    m.streaming || return
+    m.cancel === nothing || cancel!(m.cancel)
+    m.streaming = false
+    m.live = ""
+end
+
+# Clear the whole conversation — including one still streaming.
+function _vc_clear!(m::VallmoChatModel)
+    _vc_cancel!(m)
+    empty!(m.messages)
+    m.status = ""
+    m.built_n = -1
+    m.opened = false
 end
 
 function _vc_drain!(m::VallmoChatModel)
     while isready(m.deltas)
         kind, payload = take!(m.deltas)
+        m.streaming || continue        # stray events from a cancelled stream
         if kind === :delta
             m.live *= payload
             m.open_until = m.tick + 90   # tokens flowing: open, linger 3 s
@@ -335,7 +450,7 @@ function _vc_segments(s::AbstractString)
         rest = rest[nextind(rest, last(i)):end]
         j = findfirst("</think>", rest)
         if j === nothing
-            push!(segs, (String(rest), :think))
+            push!(segs, (String(rest), :think_open))   # still streaming
             return segs
         end
         push!(segs, (String(rest[1:prevind(rest, first(j))]), :think))
@@ -372,14 +487,29 @@ function _vc_wrap(par::AbstractString, w::Int)
     return out
 end
 
+# Role labels: the poppy's petal red (poppy_render.jl), desaturated to
+# sit comfortably next to prose, and its purple counterpart (same value
+# and saturation, hue swung to violet). Quantized per-terminal through
+# _poppy_term_color so 256-color mode gets cube colors, not raw RGB.
+const VALLMO_RED    = ColorRGBA(0xf2, 0x6d, 0x6f, 0xff)
+const VALLMO_PURPLE = ColorRGBA(0xb0, 0x6d, 0xf2, 0xff)
+
+# Prefill "Working…" spinner: grows and folds back, ping-pong with the
+# ends held one extra frame:  · ✢ ✶ ✻ ✽ ✽ ✻ ✶ ✢ ·
+const WORKING_FRAMES = ('·', '✢', '✶', '✻', '✽')
+
 # One message → span lines. User text and think-blocks are wrapped plain
-# (bold / dim-italic); assistant prose renders as markdown.
+# (bold / dim-italic); assistant prose renders as markdown. With
+# show_think off, think text collapses — a mid-stream (unclosed) block
+# shows a "Thinking..." spinner line instead (tick drives the spinner).
 function _vc_message_lines!(lines::Vector{Vector{Span}}, role::Symbol,
-                            s::AbstractString, w::Int)
+                            s::AbstractString, w::Int;
+                            show_think::Bool=true, tick::Int=0,
+                            truecolor::Bool=true)
     isempty(lines) || push!(lines, Span[])
-    push!(lines, [Span(role === :user ? "── you" : "── vallmo",
-                       role === :user ? tstyle(:primary, bold=true) :
-                                        tstyle(:accent, bold=true))])
+    label = role === :user ? VALLMO_PURPLE : VALLMO_RED
+    push!(lines, [Span(role === :user ? "── You" : "── Vallmo",
+                       Style(fg=_poppy_term_color(label, truecolor), bold=true))])
     plain(seg, style) = for par in split(seg, '\n')
         if isempty(strip(par))
             push!(lines, Span[])
@@ -393,11 +523,19 @@ function _vc_message_lines!(lines::Vector{Vector{Span}}, role::Symbol,
         plain(s, tstyle(:text, bold=true))
     else
         for (seg, kind) in _vc_segments(s)
-            if kind === :think
-                seg = strip(seg)                   # empty think → no lines
-                isempty(seg) || plain(seg, tstyle(:text_dim, italic=true))
+            if kind === :think || kind === :think_open
+                if show_think
+                    seg = strip(seg)               # empty think → no lines
+                    isempty(seg) || plain(seg, tstyle(:text_dim, italic=true))
+                elseif kind === :think_open
+                    si = mod1(tick ÷ 3, length(SPINNER_BRAILLE))
+                    push!(lines, [Span("$(SPINNER_BRAILLE[si]) Thinking...",
+                                       tstyle(:text_dim, italic=true))])
+                end
             else
-                append!(lines, markdown_to_spans(seg, w; text_style=tstyle(:text)))
+                append!(lines, markdown_to_spans(seg, w; text_style=tstyle(:text),
+                                                 emph_style=tstyle(:text, italic=true),
+                                                 code_style=Style(fg=Tachikoma.GREEN.c400)))
             end
         end
     end
@@ -424,16 +562,24 @@ function view(m::VallmoChatModel, f::Frame)
     end
 
     # The generation indicator: the bud opens as tokens actually arrive
-    # (not on submit — prefill wait keeps it closed) and folds shut 3 s
-    # after the last one. `open_until` is refreshed by every delta.
-    m.bloom += ((m.tick < m.open_until ? 1.0 : 0.0) - m.bloom) * 0.015
-    m.phase += 0.018 * (0.2 + 0.8 * m.bloom)
+    # (not on submit — prefill wait keeps it closed) and then stays open —
+    # the chat is still open to talk; only a cleared conversation closes
+    # it. Streaming shows in the spin instead: full speed while tokens
+    # flow, easing to a quarter of it at rest. `open_until` (refreshed by
+    # every delta) covers gaps between token bursts mid-stream; the
+    # `streaming` flag ends `active` the moment the stream finishes,
+    # without waiting out that grace window.
+    active = m.streaming && m.tick < m.open_until
+    active && (m.opened = true)
+    m.bloom += ((m.opened ? 1.0 : 0.0) - m.bloom) * 0.015
+    m.spin += ((active ? 1.0 : 1/4) - m.spin) * 0.08
+    m.phase += 0.018 * (0.2 + 0.8 * m.bloom) * m.spin
 
     input_h = clamp(length(m.input.lines), 1, 5)
-    rows = split_layout(Layout(Vertical, [Fixed(1), Fill(), Fixed(1),
+    rows = split_layout(Layout(Vertical, [Fill(), Fixed(1),
                                           Fixed(input_h)]), area)
-    length(rows) < 4 && return
-    header, main, seprow, inputrow = rows
+    length(rows) < 3 && return
+    main, seprow, inputrow = rows
 
     # The transcript covers the whole main area — text flows from the
     # left like poppy_chat's poem, only the scrollbar rides the far right
@@ -443,7 +589,7 @@ function view(m::VallmoChatModel, f::Frame)
     # bloom glows through the words instead of being punched out by them.
     transcript = main
     tints = nothing
-    if area.width >= 64
+    if area.width >= 64 && m.fade > 0
         pixels = fill(POPPY_BG, main.height * 4, main.width * 2)
         zbuf = _draw_poppy!(pixels, m.tick, m.phase, 0.35;
                             cx_frac=0.60, cy_frac=0.50, roll=0.12,
@@ -459,14 +605,6 @@ function view(m::VallmoChatModel, f::Frame)
                                        bg=:cover, fade=m.fade, smooth=m.smooth)
     end
 
-    # Header: title + endpoint; spinner while streaming
-    si = mod1(m.tick ÷ 3, length(SPINNER_BRAILLE))
-    m.streaming && set_char!(buf, header.x, header.y, SPINNER_BRAILLE[si],
-                             tstyle(:accent))
-    set_string!(buf, header.x + 2, header.y, "vallmo", tstyle(:accent, bold=true))
-    hdr = "$(DOT) $(m.base_url)" * (m.truecolor ? "" : " $(DOT) 256color")
-    set_string!(buf, header.x + 9, header.y, hdr, tstyle(:text_dim))
-
     # Transcript: a ScrollPane of styled span lines. Finished messages are
     # memoized per (count, width); the live message rebuilds every frame
     # (its markdown re-parses as it grows — a few KB, cheap at 30 fps).
@@ -476,23 +614,26 @@ function view(m::VallmoChatModel, f::Frame)
     if m.built_n != length(m.messages) || m.built_w != wrapw
         m.built = Vector{Span}[]
         for (role, s) in m.messages
-            _vc_message_lines!(m.built, role, s, wrapw)
+            _vc_message_lines!(m.built, role, s, wrapw; show_think=m.show_think,
+                               truecolor=m.truecolor)
         end
         m.built_n, m.built_w = length(m.messages), wrapw
     end
     content = m.built
-    if m.streaming
+    # Nothing shows until real tokens arrive — the reply (red label and
+    # all) appears the moment the flower opens; the prefill wait is noted
+    # on the separator instead. The blinking tail cursor is gray while
+    # inside a think block, plain text color once prose is streaming.
+    if m.streaming && !isempty(m.live)
         content = copy(m.built)
-        if isempty(m.live)
-            push!(content, Span[])
-            push!(content, [Span("── vallmo", tstyle(:accent, bold=true))])
-        else
-            _vc_message_lines!(content, :assistant, m.live, wrapw)
-        end
+        _vc_message_lines!(content, :assistant, m.live, wrapw;
+                           show_think=m.show_think, tick=m.tick,
+                           truecolor=m.truecolor)
         if (m.tick ÷ 8) % 2 == 0            # blinking cursor on the tail line
+            thinking = last(_vc_segments(m.live))[2] === :think_open
             content[end] = vcat(content[end],
                                 [Span(isempty(content[end]) ? "▌" : " ▌",
-                                      tstyle(:accent))])
+                                      thinking ? tstyle(:text_dim) : tstyle(:text))])
         end
     end
     set_content!(m.pane, content)
@@ -505,10 +646,18 @@ function view(m::VallmoChatModel, f::Frame)
     # Separator (status rides its right end), then the input
     set_string!(buf, seprow.x, seprow.y, "─"^seprow.width,
                 tstyle(:text_dim, dim=true))
-    if !isempty(m.status)
-        s = " " * first(m.status, max(seprow.width - 12, 8)) * " "
+    prefill = m.streaming && isempty(m.live) && isempty(m.status)
+    stat = !isempty(m.status) ? m.status : prefill ? "Working…" : ""
+    if !isempty(stat)
+        # each element padded a space on both sides for room from the ──
+        s = " " * first(stat, max(seprow.width - 12, 8)) * " "
+        if prefill
+            n = length(WORKING_FRAMES)
+            k = mod(m.tick ÷ 3, 2n)
+            s = " $(WORKING_FRAMES[k < n ? k + 1 : 2n - k]) " * s
+        end
         set_string!(buf, right(seprow) - length(s) - 2, seprow.y, s,
-                    startswith(m.status, "⚠") ? tstyle(:error) : tstyle(:text_dim))
+                    startswith(stat, "⚠") ? tstyle(:error) : tstyle(:text_dim))
     end
     set_string!(buf, inputrow.x + 1, inputrow.y, "❯", tstyle(:accent, bold=true))
     m.input.tick = m.tick
@@ -565,17 +714,73 @@ function view(m::VallmoChatModel, f::Frame)
     end
 end
 
+# ── Persistent settings ─────────────────────────────────────────────
+# The file holds only options the user has explicitly set — a committed
+# slash command merges just its own key(s) in. Anything absent keeps
+# following the code default, so defaults can change under users who
+# never overrode them. chat() loads at startup (kwargs/CLI flags win).
+
+const VALLMO_SETTINGS = joinpath(homedir(), ".vallmo", "settings.json")
+
+_vc_setting(m::VallmoChatModel, k::String) =
+    k == "fade"             ? m.fade :
+    k == "theme"            ? theme().name :
+    k == "url"              ? m.base_url :
+    k == "model"            ? m.model_id :
+    k == "maxtokens"        ? m.max_tokens :
+    k == "thinking_show"    ? m.show_think :
+    k == "thinking_enabled" ? m.think_enabled : nothing
+
+function _vc_save_settings(m::VallmoChatModel, keys)
+    isempty(keys) && return
+    d = try
+        isfile(VALLMO_SETTINGS) ? JSON.parse(read(VALLMO_SETTINGS, String)) : Dict()
+    catch
+        Dict()
+    end
+    d isa AbstractDict || (d = Dict())
+    for k in keys
+        d[k] = _vc_setting(m, k)
+    end
+    try
+        mkpath(dirname(VALLMO_SETTINGS))
+        write(VALLMO_SETTINGS, JSON.json(d, 2))
+    catch
+    end
+    return
+end
+
+function _vc_load_settings!(m::VallmoChatModel)
+    d = try
+        isfile(VALLMO_SETTINGS) ? JSON.parse(read(VALLMO_SETTINGS, String)) : nothing
+    catch
+        nothing                            # unreadable/corrupt: fresh defaults
+    end
+    d isa AbstractDict || return
+    haskey(d, "fade") && (m.fade = clamp(Float64(d["fade"]), 0.0, 1.0))
+    haskey(d, "url") && (m.base_url = String(d["url"]))
+    haskey(d, "model") && (m.model_id = String(d["model"]))
+    haskey(d, "maxtokens") && (m.max_tokens = max(Int(d["maxtokens"]), 0))
+    haskey(d, "thinking_show") && (m.show_think = d["thinking_show"] === true)
+    haskey(d, "thinking_enabled") && (m.think_enabled = d["thinking_enabled"] === true)
+    haskey(d, "theme") && try _vc_apply_theme!(String(d["theme"])) catch end
+    return
+end
+
 """
-    chat(; base_url = "http://127.0.0.1:8080", fade = 0.75,
-         theme_name = nothing)
+    chat(; base_url = nothing, fade = nothing, theme_name = nothing)
 
 Chat with a Vallmo `/v1/chat/completions` server; the poppy blooms while
 the model generates and closes when idle. `fade` sets the flower's
-presence (1.0 = full color, lower recedes it into the canvas; ^F cycles
-at runtime).
+presence (1.0 = full color, lower recedes it into the canvas, 0.0 hides
+it; /fade adjusts at runtime). Options persist in ~/.vallmo/settings.json;
+kwargs left as `nothing` fall back to the saved settings, then defaults.
 """
-function chat(; base_url::String="http://127.0.0.1:8080",
-                     fade::Float64=0.75, theme_name=nothing)
+function chat(; base_url=nothing, fade=nothing, theme_name=nothing)
+    m = VallmoChatModel()
+    _vc_load_settings!(m)
+    base_url === nothing || (m.base_url = String(rstrip(base_url, '/')))
+    fade === nothing || (m.fade = clamp(Float64(fade), 0.0, 1.0))
     theme_name !== nothing && set_theme!(theme_name)
-    app(VallmoChatModel(; base_url, fade); fps=30)
+    app(m; fps=30)
 end
