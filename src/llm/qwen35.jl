@@ -59,8 +59,25 @@ end
 
 # ── load ─────────────────────────────────────────────────────────────────────
 
+# Source-agnostic checkpoint opening: a directory (config.json + safetensors
+# shards), or a standard llama.cpp-convention .gguf (config synthesized from
+# its metadata, tensors re-canonicalized to HF naming — gguf_llamacpp.jl).
+# Either way: the config dict + an AbstractDict{String,Array} of tensors in
+# identical orientation, so everything downstream is source-blind.
+function open_checkpoint(path::AbstractString)
+    path = expanduser(path)
+    if isfile(path) && endswith(path, ".gguf")
+        g = GGUF(path)
+        arch = get(g.metadata, "general.architecture", nothing)
+        arch == "qwen35" || error("$path: unsupported architecture $(repr(arch))")
+        return llamacpp_qwen35(g)
+    end
+    return JSON.parsefile(joinpath(path, "config.json")),
+           SafeTensors(checkpoint_shards(path))
+end
+
 function qwen35(dir::AbstractString; Ctx::Int, B::Int, arena_bytes::Int = 64 << 20)
-    cj = JSON.parsefile(joinpath(expanduser(dir), "config.json"))
+    cj, st = open_checkpoint(dir)
     tc = cj["text_config"]
     tied = something(get(cj, "tie_word_embeddings", nothing),
                      get(tc, "tie_word_embeddings", nothing), false)
@@ -80,7 +97,6 @@ function qwen35(dir::AbstractString; Ctx::Int, B::Int, arena_bytes::Int = 64 << 
         Ctx, B,
     )
 
-    st = SafeTensors(checkpoint_shards(expanduser(dir)))
     GC.@preserve st begin   # tree's leaves alias st's mmaps; every cu() reads them
         full = tree(st)
         w = full.model.language_model

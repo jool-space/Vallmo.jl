@@ -3,6 +3,9 @@ module Vallmo
 include("safetensors/safetensors.jl")
 public safetensors
 
+include("gguf/gguf.jl")
+public GGUF
+
 using Vall: @sizes    # extracted (two consumers: our kernels, Vall's verbs)
 public @sizes
 
