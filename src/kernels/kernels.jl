@@ -8,6 +8,8 @@ using CUDACore: @cuda, i32
 using Pol: Pol, alloc, Similar, Undef, Allocating, Arena, scratchspace,
     withspace, ambientspace
 
+using Vall: @sizes
+
 macro cutile(args...)
     esc(:(@cuda backend=$cuTile $(args...)))
 end

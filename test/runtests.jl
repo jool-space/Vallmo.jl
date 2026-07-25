@@ -1,7 +1,35 @@
 using Vallmo
-using Vallmo: SafeTensors, checkpoint_shards, safetensors, tree
+using Vallmo: SafeTensors, checkpoint_shards, safetensors, tree, GGUF
 using Test
 using BFloat16s: BFloat16
+
+# Build a GGUF v3 file by hand: magic, version, tensor/kv counts, metadata
+# key-values, tensor infos, then data aligned to general.alignment (32).
+gguf_str(io, s) = (write(io, UInt64(ncodeunits(s))); write(io, s))
+function write_gguf(path; kvs, tensors)
+    open(path, "w") do io
+        write(io, "GGUF", UInt32(3), UInt64(length(tensors)), UInt64(length(kvs)))
+        for (k, vt, writer) in kvs
+            gguf_str(io, k)
+            write(io, UInt32(vt))
+            writer(io)
+        end
+        off = 0
+        for (name, dims, tid, data) in tensors
+            gguf_str(io, name)
+            write(io, UInt32(length(dims)), UInt64.(collect(dims)), UInt32(tid),
+                  UInt64(off))
+            off += 32 * cld(sizeof(data), 32)     # next tensor starts aligned
+        end
+        pad = 32 * cld(position(io), 32) - position(io)
+        write(io, zeros(UInt8, pad))
+        for (_, _, _, data) in tensors
+            write(io, data)
+            pad = 32 * cld(sizeof(data), 32) - sizeof(data)
+            write(io, zeros(UInt8, pad))
+        end
+    end
+end
 
 # Build a safetensors file by hand: 8-byte little-endian header length,
 # JSON header padded to 8-byte alignment, then raw little-endian data.
@@ -60,6 +88,75 @@ end
         @test_throws ErrorException SafeTensors(badpath)
     end
 
+    @testset "GGUF" begin
+        path = joinpath(mktempdir(), "model.gguf")
+        write_gguf(path;
+            kvs = [
+                ("general.architecture", 8, io -> gguf_str(io, "qwen")),
+                ("qwen.block_count", 4, io -> write(io, UInt32(2))),
+                ("qwen.rope.freq_base", 6, io -> write(io, Float32(10000))),
+                ("tokenizer.ggml.add_bos", 7, io -> write(io, UInt8(1))),
+                # string array and numeric array (numeric takes the read! fast path)
+                ("tokenizer.ggml.tokens", 9, io -> begin
+                    write(io, UInt32(8), UInt64(3))
+                    foreach(s -> gguf_str(io, s), ["<s>", "a", "b"])
+                end),
+                ("tokenizer.ggml.token_type", 9, io -> begin
+                    write(io, UInt32(5), UInt64(3))
+                    write(io, Int32[3, 1, 1])
+                end),
+            ],
+            tensors = [
+                # ne = [3, 2] fastest-first: contiguous 0:5 is the 3×2 whose
+                # columns are 0:2 and 3:5 — dims used as-is, nothing flipped
+                ("blk.0.w", (3, 2), 0, collect(reinterpret(UInt8, Float32.(0:5)))),
+                ("blk.1.v", (4,), 30, collect(reinterpret(UInt8, BFloat16[1, 2, 3, 4]))),
+            ])
+
+        g = GGUF(path)
+        @test length(g) == 2
+        @test g.metadata["general.architecture"] == "qwen"
+        @test g.metadata["qwen.block_count"] === UInt32(2)
+        @test g.metadata["qwen.rope.freq_base"] === Float32(10000)
+        @test g.metadata["tokenizer.ggml.add_bos"] === true
+        @test g.metadata["tokenizer.ggml.tokens"] == ["<s>", "a", "b"]
+        @test g.metadata["tokenizer.ggml.token_type"] == Int32[3, 1, 1]
+
+        W = g["blk.0.w"]
+        @test W isa Matrix{Float32}                      # honest Array, no wrapper
+        @test size(W) == (3, 2)                          # ggml dims are Julia dims
+        @test W == reshape(Float32.(0:5), 3, 2)
+        @test strides(W) == (1, 3)
+
+        v = g["blk.1.v"]
+        @test v isa Vector{BFloat16}
+        @test v == BFloat16[1, 2, 3, 4]
+
+        # Zero copy: tensors alias the mmap'd pages.
+        @test UInt(pointer(W)) - UInt(pointer(g.root)) < length(g.root)
+
+        # The same tree the safetensors path gets.
+        w = tree(g)
+        @test w.blk[1].w === W
+
+        # Quantized tensors refuse loudly; truncated data fails the bounds check.
+        qpath = joinpath(mktempdir(), "quant.gguf")
+        write_gguf(qpath; kvs = [],
+            tensors = [("q", (256,), 12, zeros(UInt8, 144))])
+        @test_throws ErrorException GGUF(qpath)
+        tpath = joinpath(mktempdir(), "trunc.gguf")
+        write_gguf(tpath; kvs = [],
+            tensors = [("t", (64, 64), 0, zeros(UInt8, 16))])
+        @test_throws ErrorException GGUF(tpath)
+
+        # A big-endian GGUF has the same magic; its version reads swapped.
+        bpath = joinpath(mktempdir(), "be.gguf")
+        open(bpath, "w") do io
+            write(io, "GGUF", bswap(UInt32(3)), bswap(UInt64(0)), bswap(UInt64(0)))
+        end
+        @test_throws "big-endian" GGUF(bpath)
+    end
+
     @testset "sharded checkpoints" begin
         entry(name, shape, offs) =
             "\"$name\": {\"dtype\": \"F32\", \"shape\": [$(join(shape, ","))], \"data_offsets\": [$(join(offs, ","))]}"
@@ -109,40 +206,4 @@ end
         @test_throws ErrorException Vallmo.tree(Dict("a" => [1], "a.b" => [2]))
     end
 
-    @testset "@sizes" begin
-        Q, K, V = zeros(64, 8, 2), zeros(64, 100, 4, 2), zeros(32, 100, 4, 2)
-        Vallmo.@sizes begin
-            Q => (Dqk, Hq, B)
-            K => (Dqk, Lkv, Hkv, B)
-            V => (Dv, Lkv, Hkv, B)
-        end
-        @test (Dqk, Hq, B, Lkv, Hkv, Dv) == (64, 8, 2, 100, 4, 32)
-
-        Kbad = zeros(63, 100, 4, 2)
-        @test_throws DimensionMismatch Vallmo.@sizes begin
-            Q => (D, H, B2)
-            Kbad => (D, L, Hk, B2)
-        end
-        @test_throws DimensionMismatch Vallmo.@sizes Q => (D2, N2)   # ndims
-        X = zeros(3, 7)
-        Vallmo.@sizes X => (3, N3)                                   # literal + single-line
-        @test N3 == 7
-        @test_throws DimensionMismatch Vallmo.@sizes X => (4, _)
-
-        R = zeros(3, 3, 5)
-        Vallmo.@sizes R => (3, 3, N4)                                # repeated literals
-        @test N4 == 5
-
-        Y, bias = zeros(64, 2), nothing
-        Vallmo.@sizes begin                                          # nothing skips its line
-            Y    => (D4, B4)
-            bias => (D4,)
-        end
-        @test (D4, B4) == (64, 2)
-        badbias = zeros(63)
-        @test_throws DimensionMismatch Vallmo.@sizes begin           # present optional checks
-            Y       => (D5, _)
-            badbias => (D5,)
-        end
-    end
 end

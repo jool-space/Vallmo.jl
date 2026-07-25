@@ -1,5 +1,5 @@
 # qwen35.jl — the model is a file. Weights are nouns (the checkpoint's own
-# tree, packed once at load), forwards are verbs (kernels + cuBLASLt).
+# tree, packed once at load), forwards are verbs (kernels + Vall).
 # Decode temporaries live in a model-owned Arena: step! opens a step frame
 # (residual x/xn/h), each layer a nested frame (everything else), so all
 # layers share one region and every step replays the same addresses — which
@@ -26,7 +26,8 @@
 #   mtp_* weights (multi-token prediction) sit in the tree, unread.
 
 using CUDACore: CUDACore, cu, CuArray, CuMatrix, CuVector
-using cuBLASLt: matmul!
+using Vall: linear!, linear
+import cuBLASLt    # loading it is the opt-in: Vall's :lt provider activates
 
 softplus(x) = log1p(exp(x))
 
@@ -43,9 +44,11 @@ Base.getproperty(l::Layer, s::Symbol) =
     s === :w ? getfield(l, :w) : getproperty(getfield(l, :w), s)
 Base.propertynames(l::Layer) = propertynames(getfield(l, :w))
 
-struct Qwen35{CFG,E,NW,R,L,SP}
+struct Qwen35{CFG,E,H,NW,R,L,SP}
     cfg    :: CFG       # parsed text_config as a NamedTuple
-    E      :: E         # (D, vocab) BF16 — embedding AND lm head (tied)
+    E      :: E         # (D, vocab) BF16 — the embedding
+    head   :: H         # (D, vocab) — lm head: E itself when tied (4B),
+                        #   the checkpoint's own lm_head.weight when not (9B)
     norm_w :: NW        # (D,) final norm
     rope   :: R         # (; cos, sin) :: (HALF_ROT, Ctx) Float32
     layers :: L         # Vector{Union{AttnLayer, DeltaNetLayer}} (union-split)
@@ -56,8 +59,28 @@ end
 
 # ── load ─────────────────────────────────────────────────────────────────────
 
+# Source-agnostic checkpoint opening: a directory (config.json + safetensors
+# shards), or a standard llama.cpp-convention .gguf (config synthesized from
+# its metadata, tensors re-canonicalized to HF naming — gguf_llamacpp.jl).
+# Either way: the config dict + an AbstractDict{String,Array} of tensors in
+# identical orientation, so everything downstream is source-blind.
+function open_checkpoint(path::AbstractString)
+    path = expanduser(path)
+    if isfile(path) && endswith(path, ".gguf")
+        g = GGUF(path)
+        arch = get(g.metadata, "general.architecture", nothing)
+        arch == "qwen35" || error("$path: unsupported architecture $(repr(arch))")
+        return llamacpp_qwen35(g)
+    end
+    return JSON.parsefile(joinpath(path, "config.json")),
+           SafeTensors(checkpoint_shards(path))
+end
+
 function qwen35(dir::AbstractString; Ctx::Int, B::Int, arena_bytes::Int = 64 << 20)
-    tc = JSON.parsefile(joinpath(expanduser(dir), "config.json"))["text_config"]
+    cj, st = open_checkpoint(dir)
+    tc = cj["text_config"]
+    tied = something(get(cj, "tie_word_embeddings", nothing),
+                     get(tc, "tie_word_embeddings", nothing), false)
     cfg = (;
         D    = Int(tc["hidden_size"]),
         eps  = Float32(tc["rms_norm_eps"]),
@@ -74,17 +97,18 @@ function qwen35(dir::AbstractString; Ctx::Int, B::Int, arena_bytes::Int = 64 << 
         Ctx, B,
     )
 
-    st = SafeTensors(checkpoint_shards(expanduser(dir)))
     GC.@preserve st begin   # tree's leaves alias st's mmaps; every cu() reads them
-        w = tree(st).model.language_model
-        E = cu(w.embed_tokens.weight)                    # (D, vocab), tied head
+        full = tree(st)
+        w = full.model.language_model
+        E = cu(w.embed_tokens.weight)                    # (D, vocab)
+        head = tied ? E : cu(full.lm_head.weight)        # untied: own tensor
 
         layers = map(collect(enumerate(w.layers))) do (i, lw)
             cfg.layer_types[i] == "full_attention" ?
                 attn_layer(lw, cfg) : deltanet_layer(lw, cfg)
         end
 
-        return Qwen35(cfg, E, cu(w.norm.weight), rope_tables(cfg), layers,
+        return Qwen35(cfg, E, head, cu(w.norm.weight), rope_tables(cfg), layers,
                       Arena(CuVector{UInt8}(undef, arena_bytes)),
                       Int32(tc["eos_token_id"] + 1))
     end
@@ -142,6 +166,24 @@ function deltanet_layer(lw, cfg)
     ))
 end
 
+"""
+    reset!(m::Qwen35)
+
+Zero the model-level recurrent state — deltanet `S` and `conv_state` —
+which carries across generations (nothing masks it). The K/V caches need
+no reset: attention reads them through `positions`, and prefill overwrites
+the rows it uses.
+"""
+function reset!(m::Qwen35)
+    for l in m.layers
+        if l isa DeltaNetLayer
+            l.S .= 0f0
+            l.conv_state .= zero(eltype(l.conv_state))
+        end
+    end
+    return m
+end
+
 # ── the decode step (the capture target) ─────────────────────────────────────
 
 function decode!(h, l::AttnLayer, m::Qwen35, gen, xn)
@@ -151,7 +193,7 @@ function decode!(h, l::AttnLayer, m::Qwen35, gen, xn)
     # most one wrapper over a CuArray (cuTile's device_pointer limit), so:
     # reshape the whole buffer (still a CuArray), then single strided views.
     qkv = alloc(BFloat16, Dh * (2Hq + 2Hkv), B)
-    matmul!(qkv, transpose(l.Wqkv), xn)
+    linear!((; y = qkv), xn, l.Wqkv)
     qkv3 = reshape(qkv, (Dh, 2Hq + 2Hkv, B))
     qg, k, v = splitaxis(qkv3, (2Hq, Hkv, Hkv); dims = 2)
     q      = view(qkv3, :, 1:2:2Hq, :)     # [q|gate] interleaves per head:
@@ -163,7 +205,7 @@ function decode!(h, l::AttnLayer, m::Qwen35, gen, xn)
         m.rope.cos, m.rope.sin; positions = gen.positions, eps, offset = 1f0)
     (; O) = decode_attention(q, l.K_cache, l.V_cache; lengths = gen.positions)
     O .*= sigmoid.(q_gate)
-    matmul!(h, transpose(l.Wo), reshape(O, :, B))
+    linear!((; y = h), reshape(O, :, B), l.Wo)
     return
 end
 
@@ -172,8 +214,8 @@ function decode!(h, l::DeltaNetLayer, m::Qwen35, gen, xn)
     n = 2DkL * HkL + DvL * HvL
     qz = alloc(BFloat16, n + DvL * HvL, B)
     ab = alloc(BFloat16, 2HvL, B)
-    matmul!(qz, transpose(l.Wqz), xn)
-    matmul!(ab, transpose(l.Wab), xn)
+    linear!((; y = qz), xn, l.Wqz)
+    linear!((; y = ab), xn, l.Wab)
     qz3 = reshape(qz, (DkL, 2HkL + 2HvL, B))
     conv_in = view(qz, 1:n, :)                       # the q|k|v slots, flat
     _, _, _, z = splitaxis(qz3, (HkL, HkL, HvL, HvL); dims = 2)
@@ -187,18 +229,18 @@ function decode!(h, l::DeltaNetLayer, m::Qwen35, gen, xn)
     (; O) = fused_deltanet_decode(q, k, v, alpha, beta, z,
         l.A_log, l.dt_bias, l.gnorm_w, l.S;
         eps, output_override = (; S′ = l.S))                     # S′ = S: in place
-    matmul!(h, transpose(l.Wout), reshape(O, :, B))
+    linear!((; y = h), reshape(O, :, B), l.Wout)
     return
 end
 
 function mlp!(h, mlp, cfg, xn)
     (; inter, B) = cfg
     gu = alloc(BFloat16, 2inter, B)
-    matmul!(gu, transpose(mlp.Wgu), xn)
+    linear!((; y = gu), xn, mlp.Wgu)
     gate, up = splitaxis(gu, 2)
     mid = alloc(BFloat16, inter, B)
     mid .= silu.(gate) .* up
-    matmul!(h, transpose(mlp.Wd), mid)
+    linear!((; y = h), mid, mlp.Wd)
     return
 end
 
@@ -225,7 +267,7 @@ function step!(m::Qwen35, gen)
             fused_add_rms_norm!((; Y = xn, X′ = x), x, h, next_w; eps, offset = 1f0)
         end
 
-        lm_head_argmax!((; Result = gen.result), xn, m.E)   # scratch: step frame
+        lm_head_argmax!((; Result = gen.result), xn, m.head)   # scratch: step frame
     end
     return
 end
@@ -249,11 +291,11 @@ end
 # (Dh, H, T, B) → (Dh, T, H, B), the kernels' time-second convention
 tsecond(x) = permutedims(x, (1, 3, 2, 4))
 
-function forward(l::AttnLayer, m::Qwen35, xn, T, B)
-    cos_t = @view m.rope.cos[:, 1:T]
-    sin_t = @view m.rope.sin[:, 1:T]
+function forward(l::AttnLayer, m::Qwen35, xn, T, B; offset::Int = 0)
+    cos_t = @view m.rope.cos[:, offset+1:offset+T]
+    sin_t = @view m.rope.sin[:, offset+1:offset+T]
     (; eps, Dh, Hq, Hkv, rot_half) = m.cfg
-    qkv = matmul!(similar(xn, size(l.Wqkv, 2), T * B), transpose(l.Wqkv), xn)
+    qkv = linear(Similar(xn), xn, l.Wqkv).y
     Nq = 2Dh * Hq
     qg = reshape(view(qkv, 1:Nq, :), (Dh, 2, Hq, T, B))
     q  = qg[:, 1, :, :, :]                       # (Dh, Hq, T, B)
@@ -263,26 +305,43 @@ function forward(l::AttnLayer, m::Qwen35, xn, T, B)
 
     qr = tsecond(apply_rope(head_rmsnorm(q, l.qw, eps), cos_t, sin_t, rot_half))
     kr = tsecond(apply_rope(head_rmsnorm(k, l.kw, eps), cos_t, sin_t, rot_half))
-    copyto!(view(l.K_cache, :, 1:T, :, :), BFloat16.(kr))
-    copyto!(view(l.V_cache, :, 1:T, :, :), BFloat16.(tsecond(v)))
+    copyto!(view(l.K_cache, :, offset+1:offset+T, :, :), BFloat16.(kr))
+    copyto!(view(l.V_cache, :, offset+1:offset+T, :, :), BFloat16.(tsecond(v)))
 
+    # Queries are the suffix of keys — the kernel derives the causal
+    # offset as k_len − q_len, so chunked (suffix) prefill is free.
     o = similar(xn, Dh, T, Hq, B)
     attention!((; O = o), BFloat16.(qr),
-        view(l.K_cache, :, 1:T, :, :), view(l.V_cache, :, 1:T, :, :);
+        view(l.K_cache, :, 1:offset+T, :, :), view(l.V_cache, :, 1:offset+T, :, :);
         causal = true)
     o .*= sigmoid.(tsecond(Float32.(g)))
-    return matmul!(similar(xn), transpose(l.Wo),
-                   reshape(permutedims(o, (1, 3, 2, 4)), (Dh * Hq, T * B)))
+    return linear(Similar(xn),
+                  reshape(permutedims(o, (1, 3, 2, 4)), (Dh * Hq, T * B)), l.Wo).y
 end
 
-function forward(l::DeltaNetLayer, m::Qwen35, xn, T, B)
+function forward(l::DeltaNetLayer, m::Qwen35, xn, T, B; offset::Int = 0)
     (; eps, DkL, DvL, HkL, HvL) = m.cfg
-    qz = matmul!(similar(xn, size(l.Wqz, 2), T * B), transpose(l.Wqz), xn)
-    ab = matmul!(similar(xn, size(l.Wab, 2), T * B), transpose(l.Wab), xn)
+    qz = linear(Similar(xn), xn, l.Wqz).y
+    ab = linear(Similar(xn), xn, l.Wab).y
     n = 2DkL * HkL + DvL * HvL
-    conv = similar(xn, n, T, B)
-    causal_conv1d_sequence!((; Y = conv), reshape(qz[1:n, :], (n, T, B)),
-        l.conv_w, l.conv_b; σ = silu, S′ = l.conv_state)
+    X = reshape(qz[1:n, :], (n, T, B))
+    if offset == 0
+        conv = similar(xn, n, T, B)
+        causal_conv1d_sequence!((; Y = conv), X,
+            l.conv_w, l.conv_b; σ = silu, S′ = l.conv_state)
+    else
+        # The conv window crosses the suffix boundary; the ring buffer's
+        # columns 2:K hold the last K−1 raw prefix inputs (zeros where the
+        # prefix was shorter — the kernel's own left padding), so prepend
+        # them, convolve, and drop the K−1 warm-up outputs. The S′ seed
+        # from the extended tail is the correct new state.
+        Km1 = size(l.conv_state, 2) - 1
+        Xext = cat(l.conv_state[:, 2:end, :], X; dims = 2)
+        Yext = similar(xn, n, T + Km1, B)
+        causal_conv1d_sequence!((; Y = Yext), Xext,
+            l.conv_w, l.conv_b; σ = silu, S′ = l.conv_state)
+        conv = Yext[:, Km1+1:end, :]
+    end
     cf = reshape(conv, (n, T * B))
 
     l2n(y) = Float32.(y) ./ .√(sum(abs2, Float32.(y); dims=1) .+ 1f-6)
@@ -305,13 +364,15 @@ function forward(l::DeltaNetLayer, m::Qwen35, xn, T, B)
     rstd = 1f0 ./ .√(sum(abs2, o; dims=1) ./ DvL .+ eps)
     o .*= rstd .* reshape(Float32.(l.gnorm_w), (DvL, 1, 1, 1)) .*
           silu.(tsecond(Float32.(z)))
-    return matmul!(similar(xn), transpose(l.Wout),
-        BFloat16.(reshape(permutedims(o, (1, 3, 2, 4)), (DvL * HvL, T * B))))
+    return linear(Similar(xn),
+        BFloat16.(reshape(permutedims(o, (1, 3, 2, 4)), (DvL * HvL, T * B))), l.Wout).y
 end
 
-function prefill!(m::Qwen35, gen, ids)
+function prefill!(m::Qwen35, gen, ids; offset::Int = 0)
     (; D, eps) = m.cfg
     T, B = size(ids)
+    offset + T <= m.cfg.Ctx ||
+        throw(ArgumentError("prefill past Ctx: offset $offset + $T tokens > $(m.cfg.Ctx)"))
 
     x = m.E[:, vec(ids)]                                 # (D, T·B) gather
     xn = similar(x)
@@ -319,18 +380,50 @@ function prefill!(m::Qwen35, gen, ids)
     rms_norm!((; Y = xn), x, first(m.layers).norm1; eps, offset = 1f0)   # prologue (see step!)
 
     for (i, l) in enumerate(m.layers)
-        h = forward(l, m, xn, T, B)
+        h = forward(l, m, xn, T, B; offset)
         fused_add_rms_norm!((; Y = xn, X′ = x), x, h, l.norm2; eps, offset = 1f0)
 
-        gu = matmul!(similar(x, 2m.cfg.inter, T * B), transpose(l.mlp.Wgu), xn)
+        gu = linear(Similar(xn), xn, l.mlp.Wgu).y
         mid = silu.(view(gu, 1:m.cfg.inter, :)) .* view(gu, m.cfg.inter+1:2m.cfg.inter, :)
-        h = matmul!(similar(x), transpose(l.mlp.Wd), mid)
+        h = linear(Similar(x), mid, l.mlp.Wd).y
         next_w = i == length(m.layers) ? m.norm_w : m.layers[i+1].norm1
         fused_add_rms_norm!((; Y = xn, X′ = x), x, h, next_w; eps, offset = 1f0)
     end
 
     xlast = view(reshape(xn, (D, T, B)), :, T, :)        # uniform T; ragged is M2+
-    lm_head_argmax!((; Result = gen.result), xlast, m.E)
-    gen.positions .= Int32(T + 1)                        # the final act: seed the clock
+    lm_head_argmax!((; Result = gen.result), xlast, m.head)
+    gen.positions .= Int32(offset + T + 1)               # the final act: seed the clock
     return
+end
+
+# ── prefix caching: the recurrent-state snapshot ─────────────────────────────
+
+"""
+    snapshot(m::Qwen35) -> snap
+    snapshot!(snap, m::Qwen35) -> snap
+    restore!(m::Qwen35, snap) -> m
+
+The state a resumable prefix needs: deltanet `S` and `conv_state` per
+layer — the only model state decode mutates in place. Attention K/V
+needs no snapshot: decode appends *beyond* the prefix rows and a suffix
+prefill overwrites from the boundary. Take the snapshot right after a
+prefill (before decode pollutes the recurrence with generated tokens),
+restore it before continuing with `prefill!(...; offset)` on the suffix.
+"""
+snapshot(m::Qwen35) =
+    Any[l isa DeltaNetLayer ? (copy(l.S), copy(l.conv_state)) : nothing
+        for l in m.layers]
+
+function snapshot!(snap, m::Qwen35)
+    for (s, l) in zip(snap, m.layers)
+        s === nothing || (copyto!(s[1], l.S); copyto!(s[2], l.conv_state))
+    end
+    return snap
+end
+
+function restore!(m::Qwen35, snap)
+    for (s, l) in zip(snap, m.layers)
+        s === nothing || (copyto!(l.S, s[1]); copyto!(l.conv_state, s[2]))
+    end
+    return m
 end

@@ -1,0 +1,20 @@
+name = "VallmoCLI"
+uuid = "f3fde6a5-f68d-4bc0-b850-98e33747bbaf"
+version = "0.1.0"
+authors = ["AntonOresten <antonoresten@proton.me> and contributors"]
+
+[deps]
+Poppy = "b79eb8f5-e7be-4dd8-bc6a-c84abce8fb8e"
+PrecompileTools = "aea7be01-6a6a-4083-8856-8a6e6704d82a"
+Vallmo = "d7e4f3a4-021c-470a-a969-608a99edde6c"
+
+[sources]
+Poppy = {path = "../chat"}
+Vallmo = {path = ".."}
+
+[compat]
+PrecompileTools = "1.3.4"
+julia = "1.12"
+
+[apps.vallmo]
+julia_flags = ["-C", "native,-avx512bf16", "-t", "4"]

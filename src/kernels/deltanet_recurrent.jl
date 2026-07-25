@@ -189,7 +189,8 @@ function deltanet_sequence!((; O, S′), Q, K, V, Beta, Gate, S)
     @cutile(blocks=(Hv, B),
         deltanet_sequence_fwd(
             Q, K, V, Beta, Gate, S, S′, O,
-            Constant(Dk), Constant(Dv), Constant(T),
+            Constant(Dk), Constant(Dv),
+            T,               # runtime: only a loop bound (see conv1d)
             Constant(Hv ÷ Hk),
             Constant(TILE_DK),
         )

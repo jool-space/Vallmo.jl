@@ -140,7 +140,8 @@ function causal_conv1d_sequence!((; Y), X, Weight, Bias; σ=nothing, S′=nothin
     @cutile(blocks=(cld(D, TILE_D), B),
         causal_conv1d_sequence_fwd(
             Y, X, Weight, Bias, σ, S′,
-            Constant(T),
+            T,               # runtime: only a loop bound — a Constant here
+                             # would recompile the kernel per sequence length
             Constant(TILE_D),
             Constant(K),
         )
