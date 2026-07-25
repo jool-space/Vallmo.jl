@@ -1,27 +1,32 @@
 # ═══════════════════════════════════════════════════════════════════════
-# Vallmo Chat ── the poppy as the generation indicator for a real model
+# Poppy Chat ── the poppy as the generation indicator for a real model
 #
-# A chat client for Vallmo's /v1/chat/completions server (Qwen3.5 on
-# the jool stack; vallmo is Swedish for poppy).  The flower IS the
-# state: a closed green bud while idle, blooming open and spinning
-# while the model streams tokens, folding shut when the answer ends.
-# The transcript covers the screen with the flower behind it (faded to
-# taste — the `fade` knob); glyphs over flower cells take the cell's
-# tint as their background, so the bloom glows through the words.
+# A chat client for any /v1/chat/completions server (vallmo is Swedish
+# for poppy; the `vallmo` command opens this client with the Vallmo
+# persona).  The flower IS the state: a closed green bud while idle,
+# blooming open and spinning while the model streams tokens, folding
+# shut when the answer ends.  The transcript covers the screen with the
+# flower behind it (faded to taste — the `fade` knob); glyphs over
+# flower cells take the cell's tint as their background, so the bloom
+# glows through the words.
 #
-#     vallmo chat [--url http://127.0.0.1:8080]
+#     poppy [--url http://127.0.0.1:8080]
 #
 # Streaming runs on a spawned task that feeds SSE deltas through a
 # Channel; the view drains it each frame, so the UI thread never
 # blocks on the network.  <think> blocks render dim.
 # ═══════════════════════════════════════════════════════════════════════
 
-@kwdef mutable struct VallmoChatModel <: Model
+@kwdef mutable struct PoppyChatModel <: Model
     quit::Bool = false
     tick::Int = 0
     truecolor::Bool = true
     base_url::String = "http://127.0.0.1:8080"
-    model_id::String = "vallmo"
+    model_id::String = "poppy"
+    # branding — the vallmo command swaps in its own persona
+    assistant_name::String = "Poppy"
+    system_prompt::String = DEFAULT_SYSTEM_PROMPT
+    settings_path::String = joinpath(homedir(), ".poppy", "settings.json")
     messages::Vector{Tuple{Symbol,String}} = Tuple{Symbol,String}[]
     live::String = ""                    # assistant text mid-stream
     streaming::Bool = false
@@ -62,15 +67,26 @@
     cmd_revert::Union{Nothing,NamedTuple} = nothing
 end
 
-should_quit(m::VallmoChatModel) = m.quit
+should_quit(m::PoppyChatModel) = m.quit
 
-function init!(m::VallmoChatModel, ::Terminal)
-    ct = lowercase(get(ENV, "COLORTERM", ""))
-    m.truecolor = occursin("truecolor", ct) || occursin("24bit", ct)
+function init!(m::PoppyChatModel, ::Terminal)
+    m.truecolor = _detect_truecolor(ENV)
     Tachikoma.enable_markdown()
 end
 
-function update!(m::VallmoChatModel, evt::KeyEvent)
+# COLORTERM is the convention, but it's an env var — one ssh hop or sudo
+# strips it. Fall back to TERM values that only RGB terminals set.
+function _detect_truecolor(env)
+    ct = lowercase(get(env, "COLORTERM", ""))
+    (occursin("truecolor", ct) || occursin("24bit", ct)) && return true
+    term = lowercase(get(env, "TERM", ""))
+    endswith(term, "-direct") && return true      # terminfo's own RGB suffix
+    return term in ("xterm-ghostty", "ghostty", "xterm-kitty", "iterm2",
+                    "xterm-iterm2", "wezterm", "alacritty", "rio", "contour",
+                    "foot", "foot-extra", "st-256color", "terminology")
+end
+
+function update!(m::PoppyChatModel, evt::KeyEvent)
     if m.show_help                       # any key closes the help panel
         m.show_help = false
         return
@@ -156,7 +172,7 @@ end
 # (OSC 52 — reaches the *local* clipboard through ssh and vscode-remote).
 # The scrollbar column and the wheel still belong to the pane. Native
 # terminal selection also works: hold Shift to bypass mouse reporting.
-function update!(m::VallmoChatModel, evt::MouseEvent)
+function update!(m::PoppyChatModel, evt::MouseEvent)
     r = m.pane_rect
     if evt.button == mouse_left && r.width > 0 &&
        Base.contains(r, evt.x, evt.y) && evt.x < right(r)
@@ -176,7 +192,7 @@ function update!(m::VallmoChatModel, evt::MouseEvent)
     handle_mouse!(m.pane, evt)
 end
 
-function _vc_copy_selection!(m::VallmoChatModel)
+function _vc_copy_selection!(m::PoppyChatModel)
     m.sel_anchor == 0 && return
     lo, hi = minmax(m.sel_anchor, m.sel_head)
     idxs = filter(i -> 1 <= i <= length(m.shown),
@@ -267,7 +283,7 @@ end
 # (update! resets hist_idx), so the next ↑ captures a fresh prefix.
 # Returns false when there is nothing to recall — ↑↓ then fall through
 # to transcript scrolling.
-function _vc_history!(m::VallmoChatModel, dir::Int)
+function _vc_history!(m::PoppyChatModel, dir::Int)
     if m.hist_idx == 0
         dir > 0 && return false                  # ↓ outside a walk
         m.hist_draft = text(m.input)
@@ -297,18 +313,18 @@ end
 # ── Streaming ───────────────────────────────────────────────────────
 
 # Sent as the first message of every request; never shown in the
-# transcript. A constant prefix, so the server's prefix cache keeps
-# paying off across turns.
-const SYSTEM_PROMPT = """
-    You are Vallmo (Swedish word meaning 'Poppy'), a \
-    helpful poppy. A detailed poppy rendering of you \
+# transcript. A constant prefix, so a server-side prefix cache keeps
+# paying off across turns. Branding hook: `chat(; system_prompt)`
+# replaces it (the vallmo command passes the Vallmo persona).
+const DEFAULT_SYSTEM_PROMPT = """
+    You are Poppy, a helpful poppy. A detailed poppy rendering of you \
     is displayed in the background of the terminal chat interface, \
     blooming as the conversation begins. \
     Since the visual representation is already present, \
     please avoid the use of emojis. \
     Be yourself: helpful first, flower second."""
 
-function _vc_submit!(m::VallmoChatModel)
+function _vc_submit!(m::PoppyChatModel)
     txt = strip(text(m.input))
     (isempty(txt) || startswith(txt, "/")) && return
     (isempty(m.history) || m.history[end] != txt) && push!(m.history, String(txt))
@@ -320,7 +336,7 @@ function _vc_submit!(m::VallmoChatModel)
     m.streaming = true
     m.pane.following = true
     m.cancel = CancelToken()
-    history = vcat(Dict("role" => "system", "content" => SYSTEM_PROMPT),
+    history = vcat(Dict("role" => "system", "content" => m.system_prompt),
                    [Dict("role" => String(r), "content" => c) for (r, c) in m.messages])
     req = Dict{String,Any}("model" => m.model_id, "messages" => history,
                            "stream" => true,
@@ -329,6 +345,69 @@ function _vc_submit!(m::VallmoChatModel)
     body = JSON.json(req)
     url, ch, tok = m.base_url * "/v1/chat/completions", m.deltas, m.cancel
     Threads.@spawn _vc_stream(url, body, ch, tok)
+end
+
+# ── SSE framing ─────────────────────────────────────────────────────
+# Enough of the WHATWG event-stream grammar that any conforming server
+# works, and no more:
+#
+#   * an event runs to the first blank line; its `data:` fields join on
+#     '\n' (one JSON object per event here, but the spec allows splits)
+#   * `field:value` and `field: value` name the same field — exactly one
+#     leading space is stripped — and a line with no colon at all is a
+#     field with an empty value
+#   * a ':'-leading line is a comment. Proxies send them as keepalives
+#     (OpenRouter's ": OPENROUTER PROCESSING", Cloudflare's bare ':'),
+#     and reading one as data desyncs the stream
+#   * lines end with \r\n, \n, or a bare \r
+#
+# Bytes arrive in whatever sizes the socket hands over, so state lives
+# across reads: `tail` holds the bytes past the last complete line and
+# `data`/`event` hold the event being assembled. A trailing '\r' stays
+# in the tail — it is either a lone terminator or the first half of a
+# \r\n landing in the next read, and only the next byte says which.
+# Splitting a multibyte character across reads is safe for the same
+# reason: '\n' and '\r' can't occur inside a UTF-8 sequence, so every
+# line boundary is a character boundary and the half-character waits in
+# the tail for its other half.
+@kwdef mutable struct SSEDecoder
+    tail::String = ""
+    data::Vector{String} = String[]
+    event::String = ""
+    bom::Bool = true                     # a leading U+FEFF is dropped once
+end
+
+# Feed one read's worth of bytes; `f(event, data)` runs per complete
+# event ("" for an unnamed one, which is what chat completions send).
+function _sse_feed!(f, dec::SSEDecoder, blob::AbstractString)
+    s = dec.tail * blob
+    if dec.bom && ncodeunits(s) >= 3      # only once the BOM can't be split
+        dec.bom = false
+        startswith(s, '\ufeff') && (s = s[4:end])
+    end
+    i, n = firstindex(s), lastindex(s)
+    while i <= n
+        j = findnext(c -> c == '\n' || c == '\r', s, i)
+        j === nothing && break
+        s[j] == '\r' && j == n && break   # ambiguous until the next byte
+        line = s[i:prevind(s, j)]
+        i = nextind(s, j)
+        s[j] == '\r' && i <= n && s[i] == '\n' && (i = nextind(s, i))
+        if isempty(line)                  # blank line: the event is complete
+            isempty(dec.data) || f(dec.event, join(dec.data, '\n'))
+            empty!(dec.data)
+            dec.event = ""
+        elseif line[1] != ':'
+            c = findfirst(':', line)
+            field = c === nothing ? line : line[1:prevind(line, c)]
+            value = c === nothing ? "" : line[nextind(line, c):end]
+            startswith(value, ' ') && (value = value[nextind(value, 1):end])
+            field == "data"  ? push!(dec.data, String(value)) :
+            field == "event" ? (dec.event = String(value)) : nothing
+        end
+    end
+    dec.tail = s[i:end]
+    return
 end
 
 function _vc_stream(url::String, body::String, ch::Channel, tok::CancelToken)
@@ -354,33 +433,41 @@ function _vc_stream(url::String, body::String, ch::Channel, tok::CancelToken)
                 end
                 is_cancelled(tok) && alive[] && close(io.stream)
             end
-            # Chunked line assembly: readline-per-byte on an HTTP.Stream
-            # is slow, and SSE events may split across chunks.
-            pending = ""
+            # Read in whatever sizes the socket gives; the decoder holds
+            # the partial line across reads (readline-per-byte on an
+            # HTTP.Stream is slow, and events split across chunks).
+            dec = SSEDecoder()
             done = false
             try
-            while !done && !eof(io)
-                pending *= String(readavailable(io))
-                while (nl = findfirst('\n', pending)) !== nothing
-                    line = rstrip(pending[1:nl-1])
-                    pending = pending[nl+1:end]
-                    startswith(line, "data: ") || continue
-                    payload = SubString(line, 7)
-                    payload == "[DONE]" && (done = true; break)
-                    obj = JSON.parse(String(payload))
-                    if haskey(obj, "error")
-                        put!(ch, (:error, string(get(obj["error"], "message", obj["error"]))))
-                        done = true
-                        break
-                    end
-                    for c in obj["choices"]
-                        d = get(c, "delta", nothing)
-                        d === nothing && continue
-                        s = get(d, "content", nothing)
-                        s isa AbstractString && !isempty(s) && put!(ch, (:delta, String(s)))
+                while !done && !eof(io)
+                    _sse_feed!(dec, String(readavailable(io))) do event, data
+                        done && return                  # past [DONE]/error
+                        strip(data) == "[DONE]" && (done = true; return)
+                        obj = try
+                            JSON.parse(data)
+                        catch
+                            return                      # non-JSON: not ours
+                        end
+                        obj isa AbstractDict || return
+                        # Errors arrive mid-stream two ways: as an `error`
+                        # key (llama.cpp, vLLM) or under an `event: error`
+                        # frame (Azure, some gateways).
+                        if event == "error" || haskey(obj, "error")
+                            e = get(obj, "error", obj)
+                            put!(ch, (:error, string(e isa AbstractDict ?
+                                                     get(e, "message", e) : e)))
+                            done = true
+                            return
+                        end
+                        for c in get(obj, "choices", ())
+                            d = get(c, "delta", nothing)
+                            d isa AbstractDict || continue
+                            s = get(d, "content", nothing)
+                            s isa AbstractString && !isempty(s) &&
+                                put!(ch, (:delta, String(s)))
+                        end
                     end
                 end
-            end
             finally
                 alive[] = false           # normal end: watcher stands down
             end
@@ -396,7 +483,7 @@ end
 
 # Stop a live stream, dropping the partial. Late events from the dying
 # task are ignored by the drain guards below (streaming is already off).
-function _vc_cancel!(m::VallmoChatModel)
+function _vc_cancel!(m::PoppyChatModel)
     m.streaming || return
     m.cancel === nothing || cancel!(m.cancel)
     m.streaming = false
@@ -404,7 +491,7 @@ function _vc_cancel!(m::VallmoChatModel)
 end
 
 # Clear the whole conversation — including one still streaming.
-function _vc_clear!(m::VallmoChatModel)
+function _vc_clear!(m::PoppyChatModel)
     _vc_cancel!(m)
     empty!(m.messages)
     m.status = ""
@@ -412,7 +499,7 @@ function _vc_clear!(m::VallmoChatModel)
     m.opened = false
 end
 
-function _vc_drain!(m::VallmoChatModel)
+function _vc_drain!(m::PoppyChatModel)
     while isready(m.deltas)
         kind, payload = take!(m.deltas)
         m.streaming || continue        # stray events from a cancelled stream
@@ -491,8 +578,8 @@ end
 # sit comfortably next to prose, and its purple counterpart (same value
 # and saturation, hue swung to violet). Quantized per-terminal through
 # _poppy_term_color so 256-color mode gets cube colors, not raw RGB.
-const VALLMO_RED    = ColorRGBA(0xf2, 0x6d, 0x6f, 0xff)
-const VALLMO_PURPLE = ColorRGBA(0xb0, 0x6d, 0xf2, 0xff)
+const POPPY_RED    = ColorRGBA(0xf2, 0x6d, 0x6f, 0xff)
+const POPPY_PURPLE = ColorRGBA(0xb0, 0x6d, 0xf2, 0xff)
 
 # Prefill "Working…" spinner: grows and folds back, ping-pong with the
 # ends held one extra frame:  · ✢ ✶ ✻ ✽ ✽ ✻ ✶ ✢ ·
@@ -505,10 +592,10 @@ const WORKING_FRAMES = ('·', '✢', '✶', '✻', '✽')
 function _vc_message_lines!(lines::Vector{Vector{Span}}, role::Symbol,
                             s::AbstractString, w::Int;
                             show_think::Bool=true, tick::Int=0,
-                            truecolor::Bool=true)
+                            truecolor::Bool=true, assistant_name::String="Poppy")
     isempty(lines) || push!(lines, Span[])
-    label = role === :user ? VALLMO_PURPLE : VALLMO_RED
-    push!(lines, [Span(role === :user ? "── You" : "── Vallmo",
+    label = role === :user ? POPPY_PURPLE : POPPY_RED
+    push!(lines, [Span(role === :user ? "── You" : "── " * assistant_name,
                        Style(fg=_poppy_term_color(label, truecolor), bold=true))])
     plain(seg, style) = for par in split(seg, '\n')
         if isempty(strip(par))
@@ -544,7 +631,7 @@ end
 
 # ── View ────────────────────────────────────────────────────────────
 
-function view(m::VallmoChatModel, f::Frame)
+function view(m::PoppyChatModel, f::Frame)
     m.tick += 1
     _vc_drain!(m)
     buf = f.buffer
@@ -615,7 +702,8 @@ function view(m::VallmoChatModel, f::Frame)
         m.built = Vector{Span}[]
         for (role, s) in m.messages
             _vc_message_lines!(m.built, role, s, wrapw; show_think=m.show_think,
-                               truecolor=m.truecolor)
+                               truecolor=m.truecolor,
+                               assistant_name=m.assistant_name)
         end
         m.built_n, m.built_w = length(m.messages), wrapw
     end
@@ -628,7 +716,8 @@ function view(m::VallmoChatModel, f::Frame)
         content = copy(m.built)
         _vc_message_lines!(content, :assistant, m.live, wrapw;
                            show_think=m.show_think, tick=m.tick,
-                           truecolor=m.truecolor)
+                           truecolor=m.truecolor,
+                           assistant_name=m.assistant_name)
         if (m.tick ÷ 8) % 2 == 0            # blinking cursor on the tail line
             thinking = last(_vc_segments(m.live))[2] === :think_open
             content[end] = vcat(content[end],
@@ -702,7 +791,7 @@ function view(m::VallmoChatModel, f::Frame)
         cell.style.bg isa Tachikoma.NoColor || continue
         bgc = canvas
         if tints !== nothing && Base.contains(main, x, y) &&
-           !(0x2800 <= UInt32(cell.char) <= 0x28ff)
+           !(isvalid(cell.char) && 0x2800 <= UInt32(cell.char) <= 0x28ff)
             t = tints[y - main.y + 1, x - main.x + 1]
             t == POPPY_BG || (bgc = _poppy_term_color(t, m.truecolor))
         end
@@ -719,10 +808,10 @@ end
 # slash command merges just its own key(s) in. Anything absent keeps
 # following the code default, so defaults can change under users who
 # never overrode them. chat() loads at startup (kwargs/CLI flags win).
+# The file lives at `m.settings_path` — ~/.poppy/settings.json for the
+# bare client; the vallmo command points it at ~/.vallmo/settings.json.
 
-const VALLMO_SETTINGS = joinpath(homedir(), ".vallmo", "settings.json")
-
-_vc_setting(m::VallmoChatModel, k::String) =
+_vc_setting(m::PoppyChatModel, k::String) =
     k == "fade"             ? m.fade :
     k == "theme"            ? theme().name :
     k == "url"              ? m.base_url :
@@ -731,10 +820,10 @@ _vc_setting(m::VallmoChatModel, k::String) =
     k == "thinking_show"    ? m.show_think :
     k == "thinking_enabled" ? m.think_enabled : nothing
 
-function _vc_save_settings(m::VallmoChatModel, keys)
+function _vc_save_settings(m::PoppyChatModel, keys)
     isempty(keys) && return
     d = try
-        isfile(VALLMO_SETTINGS) ? JSON.parse(read(VALLMO_SETTINGS, String)) : Dict()
+        isfile(m.settings_path) ? JSON.parse(read(m.settings_path, String)) : Dict()
     catch
         Dict()
     end
@@ -743,16 +832,16 @@ function _vc_save_settings(m::VallmoChatModel, keys)
         d[k] = _vc_setting(m, k)
     end
     try
-        mkpath(dirname(VALLMO_SETTINGS))
-        write(VALLMO_SETTINGS, JSON.json(d, 2))
+        mkpath(dirname(m.settings_path))
+        write(m.settings_path, JSON.json(d, 2))
     catch
     end
     return
 end
 
-function _vc_load_settings!(m::VallmoChatModel)
+function _vc_load_settings!(m::PoppyChatModel)
     d = try
-        isfile(VALLMO_SETTINGS) ? JSON.parse(read(VALLMO_SETTINGS, String)) : nothing
+        isfile(m.settings_path) ? JSON.parse(read(m.settings_path, String)) : nothing
     catch
         nothing                            # unreadable/corrupt: fresh defaults
     end
@@ -768,16 +857,26 @@ function _vc_load_settings!(m::VallmoChatModel)
 end
 
 """
-    chat(; base_url = nothing, fade = nothing, theme_name = nothing)
+    chat(; base_url = nothing, fade = nothing, theme_name = nothing,
+           assistant_name = nothing, system_prompt = nothing,
+           settings_path = nothing)
 
-Chat with a Vallmo `/v1/chat/completions` server; the poppy blooms while
-the model generates and closes when idle. `fade` sets the flower's
-presence (1.0 = full color, lower recedes it into the canvas, 0.0 hides
-it; /fade adjusts at runtime). Options persist in ~/.vallmo/settings.json;
-kwargs left as `nothing` fall back to the saved settings, then defaults.
+Chat with a `/v1/chat/completions` server; the poppy blooms while the
+model generates and closes when idle. `fade` sets the flower's presence
+(1.0 = full color, lower recedes it into the canvas, 0.0 hides it;
+/fade adjusts at runtime). Options persist in `settings_path` (default
+~/.poppy/settings.json); kwargs left as `nothing` fall back to the
+saved settings, then defaults. `assistant_name` labels replies in the
+transcript and `system_prompt` opens every request — the branding
+hooks a wrapper like the vallmo command fills in.
 """
-function chat(; base_url=nothing, fade=nothing, theme_name=nothing)
-    m = VallmoChatModel()
+function chat(; base_url=nothing, fade=nothing, theme_name=nothing,
+                assistant_name=nothing, system_prompt=nothing,
+                settings_path=nothing)
+    m = PoppyChatModel()
+    assistant_name === nothing || (m.assistant_name = String(assistant_name))
+    system_prompt === nothing || (m.system_prompt = String(system_prompt))
+    settings_path === nothing || (m.settings_path = String(settings_path))
     _vc_load_settings!(m)
     base_url === nothing || (m.base_url = String(rstrip(base_url, '/')))
     fade === nothing || (m.fade = clamp(Float64(fade), 0.0, 1.0))

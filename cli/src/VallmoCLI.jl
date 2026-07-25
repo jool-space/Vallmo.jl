@@ -1,28 +1,21 @@
 """
     VallmoCLI
 
-The `vallmo` command — Julia app (1.12) wrapping the jool stack's Qwen3.5
-serving loop and its poppy-fronted chat client.
+The `vallmo` command — Julia app (1.12) tying the twins together:
+Poppy (the server-agnostic chat TUI) opened with the Vallmo persona,
+and Vallmo's server (Qwen3.5 on the jool stack).
 
-    vallmo chat  [--url …] [--fade …] [--theme …]
-    vallmo serve [--dir …] [--tokenizer …] [--host …] [--port …] [--ctx …] [--max-new …]
+    vallmo chat  [--url …]
+    vallmo serve [--model …] [--tokenizer …] [--host …] [--port …] [--ctx …] [--max-new …]
 
-`chat` is the default command and loads only the TUI stack; `serve`
-lazily imports Vallmo and the CUDA packages, so the client stays snappy
-and runs on GPU-less machines.
+`chat` is the default command and loads only Poppy's TUI stack; `serve`
+lazily imports Vallmo (and the CUDA stack with it), so the client stays
+snappy and runs on GPU-less machines.
 """
 module VallmoCLI
 
-using Tachikoma
-@tachikoma_app          # extend view/update!/init!/should_quit for our Model
-using CommonMark        # activates TachikomaMarkdownExt at load (and precompile)
-using HTTP, JSON
-using Base64: base64encode
+import Poppy
 using PrecompileTools
-
-include("poppy_render.jl")
-include("commands.jl")
-include("chat.jl")
 
 const USAGE = """
 vallmo — Qwen3.5 on the jool stack: server and chat client
@@ -32,12 +25,26 @@ vallmo — Qwen3.5 on the jool stack: server and chat client
       Settings live in-chat: type `/` for fuzzy-matched commands
       (/fade, /theme, /url, /model, /maxtokens, /clear) with live preview.
 
-  vallmo serve [--dir MODELS_DIR|model.gguf] [--tokenizer tokenizer.json]
+  vallmo serve [--model HF_MODEL_DIR|model.gguf] [--tokenizer tokenizer.json]
                [--host 127.0.0.1] [--port 8080] [--ctx 4096] [--max-new 2048]
       /v1/chat/completions over captured decode with prefix caching.
 
   vallmo help
 """
+
+# The Vallmo persona over Poppy's neutral defaults. A constant prefix
+# on every request, so the server's prefix cache keeps paying off
+# across turns.
+const SYSTEM_PROMPT = """
+    You are Vallmo (Swedish word meaning 'Poppy'), a \
+    helpful poppy. A detailed poppy rendering of you \
+    is displayed in the background of the terminal chat interface, \
+    blooming as the conversation begins. \
+    Since the visual representation is already present, \
+    please avoid the use of emojis. \
+    Be yourself: helpful first, flower second."""
+
+const SETTINGS = joinpath(homedir(), ".vallmo", "settings.json")
 
 function chat_cmd(args)
     # nothing = flag not given → saved settings (then defaults) apply
@@ -47,21 +54,18 @@ function chat_cmd(args)
         i + 1 <= length(args) || (println(stderr, "vallmo chat: $(args[i]) needs a value"); return 1)
         opts[args[i]] = args[i+1]
     end
-    chat(; base_url = opts["--url"])
+    Poppy.chat(; base_url = opts["--url"], assistant_name = "Vallmo",
+                 system_prompt = SYSTEM_PROMPT, settings_path = SETTINGS)
     return 0
 end
 
 function serve_cmd(args)
-    @eval begin
-        import Vallmo
-        import CUDACore
-        import cuBLASLt
-        import HuggingFaceTokenizers
-    end
-    if !isdefined(@__MODULE__, :_serve_main)
-        Base.include(@__MODULE__, joinpath(@__DIR__, "serve_impl.jl"))
-    end
-    Base.invokelatest(_serve_main, args)
+    @eval import Vallmo         # the CUDA stack comes with it
+    # Resolve the binding via invokelatest: naming `Vallmo` directly
+    # reads the global in this function's (pre-import) world, which
+    # 1.12 warns on and later versions will error on.
+    V = Base.invokelatest(getglobal, @__MODULE__, :Vallmo)
+    Base.invokelatest(V.serve, args)
     return 0
 end
 
@@ -78,39 +82,15 @@ function (@main)(argv)
     return 1
 end
 
-public chat, main
+public main
 
-# Bake the chat's hot paths into the package image: the render loop,
-# markdown → spans, the poppy point cloud, slash-command mode. Without
-# this the first frame pays ~2.6 s of JIT; with it, milliseconds. The
-# serve path is left alone — its startup is model load + GPU warmup,
-# and CUDA can't run at precompile time.
+# The chat's hot paths (render loop, markdown, the poppy point cloud)
+# are baked into Poppy's package image by its own workload; here only
+# the dispatcher needs covering. The serve path is left alone — its
+# startup is model load + GPU warmup, and CUDA can't run at precompile
+# time.
 @compile_workload begin
     redirect_stdout(devnull) do
-        m = VallmoChatModel()
-        push!(m.messages, (:user, "hello"))
-        push!(m.messages,
-              (:assistant, "<think>think</think>\n# H\n**b** `c` and\n- item\n"))
-        m.bloom = 0.6
-        area = Rect(1, 1, 100, 30)
-        f = Frame(Buffer(area), area, GraphicsRegion[], PixelSnapshot[])
-        view(m, f)
-        for c in collect("hi\\")
-            update!(m, KeyEvent(:char, c))
-        end
-        update!(m, KeyEvent(:enter))            # backslash continuation
-        update!(m, KeyEvent(:backspace))
-        view(m, f)
-        for c in collect("/the")                # command mode + fuzzy + preview
-            update!(m, KeyEvent(:char, c))
-        end
-        update!(m, KeyEvent(:tab))
-        update!(m, KeyEvent(:down))
-        view(m, f)
-        update!(m, KeyEvent(:escape))
-        update!(m, MouseEvent(5, 5, mouse_scroll_down, mouse_press,
-                              false, false, false))
-        view(m, f)
         main(["help"])
     end
 end

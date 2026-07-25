@@ -1,10 +1,6 @@
-# server.jl — /v1/chat/completions over the captured decode.
-#
-#     vallmo serve [--dir MODELS|model.gguf] [--tokenizer tokenizer.json]
-#                  [--port 8080] [--ctx 4096] [--max-new 2048]
-#
-# Loaded lazily by VallmoCLI.serve_cmd — `vallmo chat` never pays for
-# the CUDA stack.
+# server.jl — `/v1/chat/completions` over the captured decode; what
+# `vallmo serve` runs. The engine's canonical interface, vLLM-style:
+# HTTP + the Bop tokenizer over generate_captured!, nothing else.
 #
 # One model, one GPU worker, one queue: requests serialize through a
 # `Channel{Job}` into the worker task that owns the model, so the HTTP
@@ -12,13 +8,13 @@
 # warmup and graph capture are paid on the first request, every later
 # request replays the same graph from token 1 (same buffers, same
 # addresses). Decoding is greedy (lm_head_argmax!); sampling params are
-# accepted and ignored. Run single-threaded: the tokenizer is PythonCall-
-# backed, and everything here is designed to interleave on one thread.
+# accepted and ignored. The tokenizer (Bop) is pure Julia and safe to
+# share across handler threads; the GPU stays serialized via the queue.
 
-using Vallmo: Vallmo, qwen35, Generation, generate_captured!, CaptureSession
-import HuggingFaceTokenizers as Tokenizers
-using CUDACore: CuMatrix
-using HTTP, JSON
+import CUDACore
+import HTTP
+import JSON
+import Bop
 
 # ── chat template (Qwen3.5) ──────────────────────────────────────────────────
 
@@ -84,14 +80,21 @@ function serve_worker(model, gen, tok, session, jobs)
                                           Vallmo.snapshot!(snap, model)
                 cached = ids_h
             end
-            ids = CuMatrix{Int32}(reshape(ids_h[Tc+1:end], :, 1))
+            ids = CUDACore.CuMatrix{Int32}(reshape(ids_h[Tc+1:end], :, 1))
             acc = Int32[]
             hit_eos = false
             sent = ""
             emit! = function ()
-                full = Tokenizers.decode(tok, acc .- 1)
-                safe = endswith(full, '�') ?
-                    full[1:prevind(full, lastindex(full))] : full
+                full = Bop.decode(tok, acc .- 1)
+                # Byte-level BPE token boundaries can split a codepoint:
+                # Bop.decode then passes the raw incomplete bytes through
+                # (no '�' substitution), so trim by validity, not by char.
+                safe = full
+                while !isempty(safe)
+                    c = safe[lastindex(safe)]
+                    (c == '�' || !isvalid(c)) || break
+                    safe = safe[1:prevind(safe, lastindex(safe))]
+                end
                 if startswith(safe, sent) && ncodeunits(safe) > ncodeunits(sent)
                     put!(job.out, (:delta, safe[ncodeunits(sent)+1:end]))
                     sent = safe
@@ -145,7 +148,7 @@ function handle_chat(http, st)
     body = JSON.parse(String(read(http)))
     prompt = render_chat(body["messages"];
                          enable_think = get(body, "enable_thinking", true) === true)
-    ids = Tokenizers.encode(st.tok, prompt).ids .+ 1     # 0-based → 1-based
+    ids = Bop.encode(st.tok, prompt).ids .+ 1            # 0-based → 1-based
     T = length(ids)
     room = st.ctx - T - 1
     room >= 1 || return respond_json(http, 400,
@@ -228,7 +231,7 @@ end
 # ── main ─────────────────────────────────────────────────────────────────────
 
 function parse_args(args)
-    cfg = Dict("--dir" => joinpath(pkgdir(Vallmo), "models", "Qwen3.5-4B"),
+    cfg = Dict("--model" => joinpath(pkgdir(Vallmo), "models", "Qwen3.5-4B"),
                "--host" => "127.0.0.1", "--port" => "8080",
                "--ctx" => "4096", "--max-new" => "2048",
                "--tokenizer" => "")
@@ -236,31 +239,37 @@ function parse_args(args)
         haskey(cfg, args[i]) || error("unknown flag $(args[i]); knows $(keys(cfg))")
         cfg[args[i]] = args[i+1]
     end
-    return (; dir = abspath(expanduser(cfg["--dir"])), host = cfg["--host"],
+    return (; model_path = abspath(expanduser(cfg["--model"])), host = cfg["--host"],
         port = parse(Int, cfg["--port"]), ctx = parse(Int, cfg["--ctx"]),
         max_new = parse(Int, cfg["--max-new"]),
         tokenizer = isempty(cfg["--tokenizer"]) ? nothing :
                     abspath(expanduser(cfg["--tokenizer"])))
 end
 
-# GGUF holds its tokenizer in ggml's own representation (tokens/merges in
-# metadata), which we don't reconstruct into the tokenizer.json the
-# tokenizers library wants. Resolution order: --tokenizer flag, then
-# tokenizer.json in the checkpoint directory / beside the .gguf.
-function load_tokenizer(dir, tokenizer)
-    path = something(tokenizer,
-        joinpath(isfile(dir) ? dirname(dir) : dir, "tokenizer.json"))
-    isfile(path) ||
-        error("no tokenizer at $path — pass --tokenizer path/to/tokenizer.json")
-    return Tokenizers.from_file(Tokenizers.Tokenizer, path)
+# Resolution order: --tokenizer flag, then tokenizer.json in the
+# checkpoint directory / beside the .gguf, then the GGUF's own metadata
+# (Bop reads tokens/merges/pre-tokenizer straight from the header, so a
+# bare .gguf serves self-contained).
+function load_tokenizer(model_path, tokenizer)
+    tokenizer === nothing || return Bop.from_file(tokenizer)
+    path = joinpath(isfile(model_path) ? dirname(model_path) : model_path, "tokenizer.json")
+    isfile(path) && return Bop.from_file(path)
+    isfile(model_path) && endswith(model_path, ".gguf") && return Bop.from_gguf(model_path)
+    error("no tokenizer at $path — pass --tokenizer path/to/tokenizer.json")
 end
 
-function _serve_main(args)
+"""
+    serve(args)
+
+Run the server; `args` are the CLI flags: `--model`, `--tokenizer`,
+`--host`, `--port`, `--ctx`, `--max-new`.
+"""
+function serve(args::AbstractVector{<:AbstractString})
     cfg = parse_args(args)
     @info "loading tokenizer…"
-    tok = load_tokenizer(cfg.dir, cfg.tokenizer)
-    @info "loading model…" cfg.dir cfg.ctx
-    t = @elapsed model = qwen35(cfg.dir; Ctx = cfg.ctx, B = 1)
+    tok = load_tokenizer(cfg.model_path, cfg.tokenizer)
+    @info "loading model…" cfg.model_path cfg.ctx
+    t = @elapsed model = qwen35(cfg.model_path; Ctx = cfg.ctx, B = 1)
     @info "model loaded" seconds = round(t; digits = 1)
 
     gen = Generation(1, cfg.max_new)
@@ -297,12 +306,21 @@ function _serve_main(args)
 
     jobs = Channel{Job}(16)
     st = (; tok, jobs, cfg.ctx, cfg.max_new, counter = Ref(0),
-        model_id = replace(basename(cfg.dir), r"\.gguf$" => ""),
+        model_id = replace(basename(cfg.model_path), r"\.gguf$" => ""),
         created = round(Int, time()))
     errormonitor(@async serve_worker(model, gen, tok, session, jobs))
 
     @info "serving" cfg.host cfg.port
-    HTTP.serve(cfg.host, cfg.port; stream = true) do http
+    # Ctrl+C: threaded SIGINT delivery is unsafe in 1.12 — the
+    # InterruptException can land in a thread that's inside the scheduler
+    # (task_done_hook of a finished connection task), where no handler
+    # exists: "fatal: error thrown and no exception handler available".
+    # So on a TTY we take SIGINT out of the picture: cbreak mode reads
+    # the ^C byte ourselves for a quiet, graceful shutdown. Off-TTY (or
+    # `kill -INT`), exit_on_sigint(true) exits directly from the signal
+    # thread — Julia's standard interrupt printout, but never the crash.
+    Base.exit_on_sigint(true)
+    server = HTTP.serve!(cfg.host, cfg.port; stream = true) do http
         try
             handle(http, st)
         catch err
@@ -313,5 +331,53 @@ function _serve_main(args)
             end
         end
     end
+    stop = Ref(false)
+    old = stdin isa Base.TTY ? _cbreak!() : nothing
+    old === nothing || errormonitor(@async try
+        while !stop[]
+            read(stdin, UInt8) == 0x03 || continue
+            stop[] = true
+        end
+    catch                       # stdin closed — SIGINT fallback still works
+    end)
+    try
+        while isopen(server) && !stop[]
+            sleep(0.2)
+        end
+        stop[] && @info "^C — shutting down"
+    catch err
+        err isa InterruptException || rethrow()
+    finally
+        old === nothing || _restore_tty!(old)
+        close(server)
+    end
 end
 
+# ── stdin cbreak mode ───────────────────────────────────────────────
+# Clear ISIG|ICANON|ECHO on the local-mode flags only: ^C arrives as a
+# readable 0x03 instead of SIGINT, bytes come unbuffered, and — unlike
+# full raw mode — OPOST stays on so log lines keep their newlines.
+
+mutable struct Termios      # struct termios, linux
+    c_iflag::UInt32; c_oflag::UInt32; c_cflag::UInt32; c_lflag::UInt32
+    c_line::UInt8
+    c_cc::NTuple{32,UInt8}
+    c_ispeed::UInt32; c_ospeed::UInt32
+    Termios() = new(0, 0, 0, 0, 0, ntuple(_ -> 0x00, 32), 0, 0)
+end
+
+function _cbreak!()
+    t = Termios()
+    ccall(:tcgetattr, Cint, (Cint, Ref{Termios}), 0, t) == 0 || return nothing
+    old = deepcopy(t)
+    t.c_lflag &= ~UInt32(0x1 | 0x2 | 0x8)       # ISIG | ICANON | ECHO
+    cc = collect(t.c_cc)
+    cc[6+1], cc[5+1] = 0x01, 0x00               # VMIN = 1, VTIME = 0
+    t.c_cc = Tuple(cc)
+    ccall(:tcsetattr, Cint, (Cint, Cint, Ref{Termios}), 0, 0, t) == 0 ||
+        return nothing
+    return old
+end
+
+_restore_tty!(old::Termios) =
+    ccall(:tcsetattr, Cint, (Cint, Cint, Ref{Termios}), 0, 0, old)

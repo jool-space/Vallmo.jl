@@ -33,8 +33,8 @@ function _vc_apply_theme!(arg::AbstractString)
 end
 
 # /thinking: show/hide is display-only; on/off rides the request as
-# `enable_thinking` — off has the server prefill an empty think block,
-# so the model skips thinking entirely (see serve_impl.render_chat).
+# `enable_thinking` — a server that honors it (vallmo serve does)
+# prefills an empty think block, so the model skips thinking entirely.
 function _vc_thinking!(m, arg)
     if arg in ("show", "hide")
         m.show_think = (arg == "show")
@@ -75,7 +75,7 @@ const CHAT_COMMANDS = ChatCommand[
         (m, arg) -> (m.base_url = String(rstrip(arg, '/')); "url $(m.base_url)"),
         false),
     ChatCommand("model", "<id>",
-        "model id sent with each request (informational for vallmo serve)",
+        "model id sent with each request (many servers only echo it)",
         m -> m.model_id,
         m -> String[],
         (m, arg) -> (m.model_id = String(arg); "model $(arg)"),
