@@ -26,7 +26,7 @@ Vall = {path = "../Vall"}
 BFloat16s = "0.6.1"
 Bop = "0.1.0"
 CUDACore = "6.2"
-HTTP = "1"
+HTTP = "1, 2.6"
 JSON = "1.6.1"
 Microfloats = "0.2.2"
 Mmap = "1.11.0"
