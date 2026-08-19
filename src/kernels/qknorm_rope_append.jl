@@ -48,7 +48,8 @@ function qnorm_rope_fwd(
 
     q1 = ct.extract(q, (1,), (HALF_ROT,))
     q2 = ct.extract(q, (2,), (HALF_ROT,))
-    q_rot = ct.cat((q1 .* cos_v .- q2 .* sin_v, q2 .* cos_v .+ q1 .* sin_v), 1)
+    q_rot = [q1 .* cos_v .- q2 .* sin_v
+             q2 .* cos_v .+ q1 .* sin_v]
 
     ct.store(Q, (1, h, b), q_rot → eltype(Q))
 
@@ -85,7 +86,8 @@ function knorm_rope_append_fwd(
 
     k1 = ct.extract(k, (1,), (HALF_ROT,))
     k2 = ct.extract(k, (2,), (HALF_ROT,))
-    k_rot = ct.cat((k1 .* cos_v .- k2 .* sin_v, k2 .* cos_v .+ k1 .* sin_v), 1)
+    k_rot = [k1 .* cos_v .- k2 .* sin_v
+             k2 .* cos_v .+ k1 .* sin_v]
 
     ct.store(K_cache, (1, p, hₖ, b), k_rot → eltype(K_cache))
 
