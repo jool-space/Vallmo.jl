@@ -1,8 +1,5 @@
 # Vallmo
 
-[![Build Status](https://github.com/jool-space/Vallmo.jl/actions/workflows/CI.yml/badge.svg?branch=main)](https://github.com/jool-space/Vallmo.jl/actions/workflows/CI.yml?query=branch%3Amain)
-[![Coverage](https://codecov.io/gh/jool-space/Vallmo.jl/branch/main/graph/badge.svg)](https://codecov.io/gh/jool-space/Vallmo.jl)
-
 A from-scratch Qwen3.5 inference engine in Julia, running on the jool GPU stack
 (cuTile kernels, CUDA graph capture), with an OpenAI-compatible server and a
 terminal chat client. *Vallmo* is Swedish for poppy.
@@ -19,9 +16,9 @@ terminal chat client. *Vallmo* is Swedish for poppy.
 
 ## Requirements
 
-- Julia 1.12 and an NVIDIA GPU.
-- The [jool registry](https://github.com/jool-space/registry) for Bop (tokenizer), Pol (allocation and capture), and cuBLASLt. Everything else is in General.
-- Weights: the HF `Qwen/Qwen3.5-4B` (or 9B) checkpoint directory with its `tokenizer.json`, or a BF16 GGUF. Place them under `models/` or pass `--model`.
+- Julia 1.12 and an NVIDIA GPU with Compute Capability >8.0.
+- The [jool registry](https://github.com/jool-space/registry)
+- Weights: the HF `Qwen/Qwen3.5-4B` (or 9B) checkpoint directory with its `tokenizer.json`, or a BF16 GGUF.
 
 ## Running
 
@@ -51,12 +48,3 @@ ids   = CuMatrix{Int32}(reshape(Bop.encode(tok, "Hello").ids .+ 1, :, 1))
 out   = Vallmo.generate_captured!(model, gen, ids; max_new_tokens = 256)
 Bop.decode(tok, vec(out.tokens) .- 1)
 ```
-
-## Tests
-
-`Pkg.test()` covers the CPU-side pieces (safetensors, GGUF, checkpoint trees);
-the GPU path is exercised by running the server.
-
-## License
-
-MIT.
