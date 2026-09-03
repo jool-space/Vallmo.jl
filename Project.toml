@@ -12,15 +12,12 @@ Bop = "0573b79a-4d3c-4b70-9b60-9925c78b8eda"
 CUDACore = "bd0ed864-bdfe-4181-a5ed-ce625a5fdea2"
 HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
 JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
+LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 Microfloats = "31c70f10-a750-4521-b13c-797315ae2933"
 Mmap = "a63ad114-7e13-5084-954f-fe012c677804"
 Pol = "4d414b72-cacd-4c1f-bb87-6585853948d5"
-Vall = "7bc0144c-90d3-4101-a4aa-c305a24a927e"
 cuBLASLt = "448fee3d-7d89-4b6e-8554-2e2b5f03afa7"
 cuTile = "0dea8319-8c4a-4662-a73d-20234d115b9a"
-
-[sources]
-Vall = {path = "../Vall"}
 
 [compat]
 BFloat16s = "0.6.1"
@@ -28,10 +25,10 @@ Bop = "0.1.0"
 CUDACore = "6.3"
 HTTP = "1"
 JSON = "1.6.1"
+LinearAlgebra = "1.11"
 Microfloats = "0.2.2"
 Mmap = "1.11.0"
 Pol = "0.2.0"
-Vall = "0.1.0"
 cuBLASLt = "0.1.1"
 cuTile = "1"
 julia = "1.11"

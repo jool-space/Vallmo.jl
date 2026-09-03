@@ -1,5 +1,5 @@
 # qwen35.jl — the model is a file. Weights are nouns (the checkpoint's own
-# tree, packed once at load), forwards are verbs (kernels + Vall).
+# tree, packed once at load), forwards are verbs (kernels + linear).
 # Decode temporaries live in a model-owned Arena: step! opens a step frame
 # (residual x/xn/h), each layer a nested frame (everything else), so all
 # layers share one region and every step replays the same addresses — which
@@ -26,8 +26,6 @@
 #   mtp_* weights (multi-token prediction) sit in the tree, unread.
 
 using CUDACore: CUDACore, cu, CuArray, CuMatrix, CuVector
-using Vall: linear!, linear
-import cuBLASLt    # loading it is the opt-in: Vall's :lt provider activates
 
 softplus(x) = log1p(exp(x))
 
